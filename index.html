@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>写真PDF配置ツール</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="appHeader">
+    <h1>写真PDF配置ツール</h1>
+    <p class="sub">写真のExif位置情報をもとに、PDF図面上に写真ピンを自動配置します。</p>
+  </header>
+
+  <div id="mainLayout">
+
+    <!-- 左: プレビュー画面 -->
+    <section id="previewPane">
+      <div id="canvasScroll">
+        <div id="canvasStack">
+          <canvas id="pdfCanvas"></canvas>
+          <canvas id="pinCanvas"></canvas>
+        </div>
+        <div id="viewerHint" class="hint">PDFと写真を読み込むと、ここに図面と写真ピンが表示されます。</div>
+      </div>
+      <div id="calibHint" class="hint" hidden></div>
+      <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。</div>
+    </section>
+
+    <div id="splitHandle" title="ドラッグして幅を調整"></div>
+
+    <!-- 右: 設定画面 -->
+    <aside id="settingsPane">
+
+      <section class="settingBlock color-1">
+        <h2><span class="num">1</span>プロジェクト</h2>
+        <div class="buttonRow">
+          <button type="button" id="saveProjectBtn" class="primary">保存</button>
+          <button type="button" id="loadProjectBtn" class="primary">読込</button>
+        </div>
+        <input type="file" id="projectInput" accept=".json" hidden>
+        <div class="meta">読込みには保存時に作られた「project.json」を選択してください。</div>
+        <div id="projectStatus" class="meta"></div>
+      </section>
+
+      <section class="settingBlock color-2">
+        <h2><span class="num">2</span>PDF図面</h2>
+        <div id="pdfDrop" class="dropzone">
+          <p>PDFをドラッグ＆ドロップ<br>（複数ページ対応）</p>
+          <button type="button" id="pdfPickBtn">ファイルを選択</button>
+          <input type="file" id="pdfInput" accept="application/pdf" hidden>
+        </div>
+        <div id="pdfMeta" class="meta"></div>
+
+        <div class="toolgroup">
+          <button type="button" id="prevPageBtn" title="前のページ">◀</button>
+          <span id="pageIndicator">- / -</span>
+          <button type="button" id="nextPageBtn" title="次のページ">▶</button>
+        </div>
+        <label>
+          <span class="labelRow">表示倍率<span class="valWrap"><input type="number" id="pdfZoomVal" class="valInput" min="25" max="400" step="1" value="100">%</span></span>
+          <input type="range" id="pdfZoom" min="25" max="400" value="100">
+        </label>
+        <label>
+          <span class="labelRow">回転角<span class="valWrap"><input type="number" id="pdfRotateVal" class="valInput" min="0" max="360" step="1" value="0">°</span></span>
+          <input type="range" id="pdfRotate" min="0" max="360" value="0">
+        </label>
+
+        <div id="pageListBlock" hidden>
+          <h3>ページ一覧</h3>
+          <div id="pageList" class="pageList"></div>
+        </div>
+      </section>
+
+      <section class="settingBlock color-3">
+        <h2><span class="num">3</span>写真</h2>
+        <div id="photoDrop" class="dropzone">
+          <p>写真をドラッグ＆ドロップ<br>（複数選択可）</p>
+          <button type="button" id="photoPickBtn">ファイルを選択</button>
+          <input type="file" id="photoInput" accept="image/*" multiple hidden>
+        </div>
+        <div id="photoMeta" class="meta"></div>
+        <div id="photoList" class="photoList"></div>
+
+        <div id="trashBlock" hidden>
+          <h3>ゴミ箱 <span id="trashCount"></span></h3>
+          <div id="trashList" class="photoList"></div>
+        </div>
+
+        <h3>レイヤー設定</h3>
+        <label>
+          <span class="labelRow">拡大/縮小（基点：左下）<span class="valWrap">×<input type="number" id="layerScaleVal" class="valInput" min="0.01" max="100" step="0.01" value="1.00"></span></span>
+          <input type="range" id="layerScale" min="-300" max="300" value="0">
+        </label>
+        <label title="図面とGPSとで縦横比がズレている場合の補正用。基点：左下">
+          <span class="labelRow">拡大/縮小（縦）（基点：左下）<span class="valWrap">×<input type="number" id="layerScaleYVal" class="valInput" min="0.2" max="3" step="0.01" value="1.00"></span></span>
+          <input type="range" id="layerScaleY" min="0.2" max="3" step="0.01" value="1">
+        </label>
+        <label title="図面とGPSとで縦横比がズレている場合の補正用。基点：左下">
+          <span class="labelRow">拡大/縮小（横）（基点：左下）<span class="valWrap">×<input type="number" id="layerScaleXVal" class="valInput" min="0.2" max="3" step="0.01" value="1.00"></span></span>
+          <input type="range" id="layerScaleX" min="0.2" max="3" step="0.01" value="1">
+        </label>
+        <label>
+          <span class="labelRow">回転（基点：中心）<span class="valWrap"><input type="number" id="layerRotateVal" class="valInput" min="-180" max="180" step="1" value="0">°</span></span>
+          <input type="range" id="layerRotate" min="-180" max="180" value="0">
+        </label>
+        <label>
+          <span class="labelRow">サムネイルサイズ<span class="valWrap"><input type="number" id="thumbSizeVal" class="valInput" min="20" max="160" step="1" value="70">px</span></span>
+          <input type="range" id="thumbSize" min="20" max="160" value="70">
+        </label>
+        <label title="サムネイル画像の縁の太さ">
+          <span class="labelRow">サムネイルの縁の太さ<span class="valWrap"><input type="number" id="thumbBorderWidthVal" class="valInput" min="0" max="15" step="0.5" value="2">px</span></span>
+          <input type="range" id="thumbBorderWidth" min="0" max="15" step="0.5" value="2">
+        </label>
+        <label title="サムネイル画像の縁の色">
+          <span class="labelRow">サムネイルの縁の色<span class="valWrap"><input type="color" id="thumbBorderColor" value="#2563eb"></span></span>
+        </label>
+        <label>
+          <span class="labelRow">ピンサイズ<span class="valWrap"><input type="number" id="pinSizeVal" class="valInput" min="4" max="30" step="1" value="9">px</span></span>
+          <input type="range" id="pinSize" min="4" max="30" value="9">
+        </label>
+        <label title="ピンから写真サムネイルへ延びる引き出し線の太さ">
+          <span class="labelRow">引き出し線の太さ<span class="valWrap"><input type="number" id="leaderWidthVal" class="valInput" min="0.2" max="8" step="0.1" value="1.4">px</span></span>
+          <input type="range" id="leaderWidth" min="0.2" max="8" step="0.1" value="1.4">
+        </label>
+        <label title="撮影方向を示す矢印の太さ">
+          <span class="labelRow">矢印の太さ<span class="valWrap"><input type="number" id="arrowWidthVal" class="valInput" min="0.5" max="10" step="0.5" value="2">px</span></span>
+          <input type="range" id="arrowWidth" min="0.5" max="10" step="0.5" value="2">
+        </label>
+        <label title="撮影方向を示す矢印の長さ">
+          <span class="labelRow">矢印の長さ<span class="valWrap"><input type="number" id="arrowLengthVal" class="valInput" min="8" max="150" step="1" value="24">px</span></span>
+          <input type="range" id="arrowLength" min="8" max="150" value="24">
+        </label>
+        <label title="撮影方向を示す矢印の色">
+          <span class="labelRow">矢印の色<span class="valWrap"><input type="color" id="arrowColor" value="#16a34a"></span></span>
+        </label>
+        <div class="toolgroup wrap">
+          <button type="button" id="calibrateBtn">📍 2点で位置合わせ</button>
+          <button type="button" id="layerPanBtn">✋ レイヤー移動</button>
+          <button type="button" id="resetLayerBtn">レイヤーをリセット</button>
+        </div>
+      </section>
+
+      <section class="settingBlock color-4">
+        <h2><span class="num">4</span>出力</h2>
+        <div class="buttonRow">
+          <button type="button" id="exportPdfBtn" class="primary">PDF</button>
+          <button type="button" id="exportExcelBtn" class="primary">Excel</button>
+        </div>
+        <div id="exportStatus" class="meta"></div>
+      </section>
+
+    </aside>
+
+  </div>
+
+  <div id="ctxMenu" class="ctxMenu" hidden></div>
+
+  <div id="pinDetailPanel" class="ctxMenu pinDetailPanel" hidden>
+    <div class="pdTitle">このピンだけ個別設定</div>
+    <div class="pdRow">
+      <label>ピンサイズ</label>
+      <input type="number" id="pdPinSize" min="4" max="60" step="1">
+      <button type="button" data-reset="pinSizeOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>引き出し線太さ</label>
+      <input type="number" id="pdLeaderWidth" min="0.2" max="8" step="0.1">
+      <button type="button" data-reset="leaderWidthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>矢印太さ</label>
+      <input type="number" id="pdArrowWidth" min="0.5" max="10" step="0.5">
+      <button type="button" data-reset="arrowWidthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>矢印長さ</label>
+      <input type="number" id="pdArrowLength" min="8" max="150" step="1">
+      <button type="button" data-reset="arrowLengthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>矢印色</label>
+      <input type="color" id="pdArrowColor">
+      <button type="button" data-reset="arrowColorOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>サムネ縁太さ</label>
+      <input type="number" id="pdThumbBorderWidth" min="0" max="15" step="0.5">
+      <button type="button" data-reset="thumbBorderWidthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>サムネ縁色</label>
+      <input type="color" id="pdThumbBorderColor">
+      <button type="button" data-reset="thumbBorderColorOverride">既定</button>
+    </div>
+    <button type="button" id="pdCloseBtn" class="primary">閉じる</button>
+  </div>
+</div>
+
+<script src="lib/pdf.min.js"></script>
+<script src="lib/pdf-lib.min.js"></script>
+<script src="lib/exifr.umd.js"></script>
+<script src="lib/exceljs.min.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
