@@ -69,9 +69,10 @@ const state = {
   currentProjectDirHandle: null, // 直前に読込み/保存したプロジェクトフォルダ(FileSystemDirectoryHandle)。「保存(上書)」用
   currentProjectName: null,
 
-  // ---- 日付比較(1日目/2日目の同一地点写真の突き合わせ) ----
-  dayCompareThreshold: 1, // 同じ地点とみなす距離(m)
-  dayCompareRows: [],     // [{ day1Id, candidateIds: [day2Id,...] }] 1日目の各写真ごとの2日目候補(手動で間引く)
+  // ---- 日付比較(1回目/2回目の同一地点写真の突き合わせ) ----
+  dayCompareThreshold: 1,  // 同じ地点とみなす距離(m)
+  dayCompareGapHours: 2,   // 撮影時刻の間隔がこの時間(時間)以上空いたら別回とみなす
+  dayCompareRows: [],      // [{ day1Id, candidateIds: [day2Id,...] }] 1回目の各写真ごとの2回目候補(手動で間引く)
 };
 
 const el = (id) => document.getElementById(id);
@@ -224,6 +225,10 @@ function init() {
   el("dayCompareThreshold").addEventListener("change", (e) => {
     const v = Number(e.target.value);
     if (!isNaN(v) && v >= 0) state.dayCompareThreshold = v;
+  });
+  el("dayCompareGapHours").addEventListener("change", (e) => {
+    const v = Number(e.target.value);
+    if (!isNaN(v) && v > 0) state.dayCompareGapHours = v;
   });
   el("dayCompareRunBtn").addEventListener("click", () => {
     if (!state.pdfDoc) { alert("先にPDFを読み込んでください。"); return; }
@@ -659,7 +664,7 @@ function renderComparePage() {
 
   const info = document.createElement("div");
   info.className = "hint";
-  info.textContent = `1日目：${day1Key}（${day1Photos.length}枚） / 2日目以降：${day2Keys.join("、") || "-"}（${day2Photos.length}枚）`;
+  info.textContent = `1回目：${day1Key}（${day1Photos.length}枚） / 2回目以降：${day2Keys.join("、") || "-"}（${day2Photos.length}枚）`;
   box.appendChild(info);
 
   const sortedDay1 = [...day1Photos].sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
@@ -705,7 +710,7 @@ function renderComparePage() {
     const sec = document.createElement("div");
     sec.className = "compareNewSection";
     const title = document.createElement("h4");
-    title.textContent = "新規番号（1日目に該当地点なし）";
+    title.textContent = "新規番号（1回目に該当地点なし）";
     sec.appendChild(title);
     const wrap = document.createElement("div");
     wrap.className = "compareNewWrap";
@@ -878,23 +883,47 @@ function labelOfPhoto(p) {
   return p.numberLabel != null ? p.numberLabel : String(getActivePhotos().indexOf(p) + 1);
 }
 
-// ---------- 日付比較(1日目/2日目の同一地点写真の突き合わせ) ----------
-// Exif撮影日時の「年-月-日」部分。日時が無い写真はnull(比較の対象外)。
-function photoDateKey(photo) {
-  const d = photo.capturedAt;
-  if (!d) return null;
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+// ---------- 日付比較(1回目/2回目の同一地点写真の突き合わせ) ----------
+// 別の日とは限らない(同じ日でも間隔が空けば別回)ため、暦日ではなく
+// 撮影時刻の間隔(state.dayCompareGapHours時間以上空いたら別回)でグループ分けする。
+function pad2(n) { return String(n).padStart(2, "0"); }
+function formatDateTimeShort(d) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
-// 撮影日時のある GPS 写真を、最も早い日付(1日目)とそれ以外(2日目)に分ける
+function sessionLabel(group) {
+  const first = group[0].capturedAt, last = group[group.length - 1].capturedAt;
+  const a = formatDateTimeShort(first), b = formatDateTimeShort(last);
+  return a === b ? a : `${a}〜${b}`;
+}
+// 撮影日時のあるGPS写真を、撮影時刻順に並べて間隔が空いたところで区切ったグループの配列にする
+function computeSessionGroups(photos) {
+  const sorted = [...photos].sort((a, b) => a.capturedAt - b.capturedAt);
+  const gapMs = state.dayCompareGapHours * 3600 * 1000;
+  const groups = [];
+  let current = [];
+  let lastTime = null;
+  for (const p of sorted) {
+    if (lastTime != null && (p.capturedAt - lastTime) > gapMs) {
+      groups.push(current);
+      current = [];
+    }
+    current.push(p);
+    lastTime = p.capturedAt;
+  }
+  if (current.length) groups.push(current);
+  return groups;
+}
+// 撮影時刻の間隔で区切った最初のグループ(1回目)とそれ以外(2回目以降)に分ける
 function dayGroups() {
-  const gpsPhotos = getActivePhotos().filter((p) => p.hasGps && photoDateKey(p));
-  const keys = [...new Set(gpsPhotos.map(photoDateKey))].sort();
-  const day1Key = keys[0] || null;
+  const gpsPhotos = getActivePhotos().filter((p) => p.hasGps && p.capturedAt);
+  const groups = computeSessionGroups(gpsPhotos);
+  const day1Group = groups[0] || [];
+  const day2Groups = groups.slice(1);
   return {
-    day1Key,
-    day2Keys: keys.slice(1),
-    day1Photos: gpsPhotos.filter((p) => photoDateKey(p) === day1Key),
-    day2Photos: gpsPhotos.filter((p) => photoDateKey(p) !== day1Key),
+    day1Key: groups.length ? sessionLabel(day1Group) : null,
+    day2Keys: day2Groups.map(sessionLabel),
+    day1Photos: day1Group,
+    day2Photos: day2Groups.flat(),
   };
 }
 // baseX/baseYは全写真共通の1つの基準点からの平面座標(m換算)なので、
@@ -962,7 +991,7 @@ function updateDayCompareStatus() {
     return;
   }
   const matched = state.dayCompareRows.reduce((s, r) => s + r.candidateIds.length, 0);
-  box.textContent = `1日目(${day1Key})：${day1Photos.length}枚 / 2日目以降(${day2Keys.join("、") || "-"})：${day2Photos.length}枚\n` +
+  box.textContent = `1回目(${day1Key})：${day1Photos.length}枚 / 2回目以降(${day2Keys.join("、") || "-"})：${day2Photos.length}枚\n` +
     `マッチ済み：${matched}件 / 新規番号：${day2Photos.length - matched}枚`;
 }
 
@@ -2025,6 +2054,7 @@ function buildProjectManifest() {
     pages: state.pages,
     pdfSources: state.pdfSources,
     dayCompareThreshold: state.dayCompareThreshold,
+    dayCompareGapHours: state.dayCompareGapHours,
     dayCompareRows: state.dayCompareRows,
     thumbSize: state.thumbSize,
     pinSize: state.pinSize,
@@ -2179,7 +2209,9 @@ async function restoreFromManifest(manifest) {
     ? manifest.pdfSources
     : [{ name: state.pdfName, pageCount: state.numPages }];
   state.dayCompareThreshold = manifest.dayCompareThreshold != null ? manifest.dayCompareThreshold : state.dayCompareThreshold;
+  state.dayCompareGapHours = manifest.dayCompareGapHours != null ? manifest.dayCompareGapHours : state.dayCompareGapHours;
   state.dayCompareRows = Array.isArray(manifest.dayCompareRows) ? manifest.dayCompareRows : [];
+  el("dayCompareGapHours").value = state.dayCompareGapHours;
   el("dayCompareThreshold").value = state.dayCompareThreshold;
 
   state.pageView = new Map(Object.entries(manifest.pageView || {}).map(([k, v]) => [Number(k), v]));
@@ -2452,7 +2484,7 @@ async function appendDayComparePagesToPdf(outDoc, layout) {
   let page = outDoc.addPage([pageW, pageH]);
   let y = pageH - margin;
   const titleImg = await embedTextImage(
-    outDoc, `日付比較（1日目:${layout.day1Key} / 2日目以降:${layout.day2Keys.join("、") || "-"}）`, 16, "#1a1a1a");
+    outDoc, `日付比較（1回目:${layout.day1Key} / 2回目以降:${layout.day2Keys.join("、") || "-"}）`, 16, "#1a1a1a");
   page.drawImage(titleImg.png, { x: margin, y: y - titleImg.height, width: titleImg.width, height: titleImg.height });
   y -= titleImg.height + 16;
 
@@ -2494,7 +2526,7 @@ async function appendDayComparePagesToPdf(outDoc, layout) {
 
   if (layout.newOnes.length) {
     ensureSpace(30);
-    const newTitleImg = await embedTextImage(outDoc, "新規番号（1日目に該当地点なし）", 13, "#1a1a1a");
+    const newTitleImg = await embedTextImage(outDoc, "新規番号（1回目に該当地点なし）", 13, "#1a1a1a");
     page.drawImage(newTitleImg.png, { x: margin, y: y - newTitleImg.height, width: newTitleImg.width, height: newTitleImg.height });
     y -= newTitleImg.height + 12;
     const newPerRow = Math.max(1, Math.floor((pageW - margin * 2 + gap) / (cardW + gap)));
@@ -2756,7 +2788,7 @@ async function exportExcel() {
     if (compareLayout.day1Key) {
       const sheet = wb.addWorksheet("日付比較");
       sheet.getCell(1, 1).value =
-        `1日目：${compareLayout.day1Key}　/　2日目以降：${compareLayout.day2Keys.join("、") || "-"}`;
+        `1回目：${compareLayout.day1Key}　/　2回目以降：${compareLayout.day2Keys.join("、") || "-"}`;
 
       const cardW = 110, cardH = 100, gap = 10;
       const leftX = 10, rightX0 = leftX + cardW + 30;
@@ -2774,7 +2806,7 @@ async function exportExcel() {
       }
       let maxRowWidth = rightX0 + maxCandidates * (cardW + gap);
       if (compareLayout.newOnes.length) {
-        sheet.getCell(Math.round(y / 18) + 1, 1).value = "新規番号（1日目に該当地点なし）";
+        sheet.getCell(Math.round(y / 18) + 1, 1).value = "新規番号（1回目に該当地点なし）";
         y += 26;
         let x = leftX;
         for (const p of compareLayout.newOnes) {

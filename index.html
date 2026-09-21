@@ -167,7 +167,10 @@
 
       <section class="settingBlock color-5">
         <h2><span class="num">5</span>日付比較</h2>
-        <p class="meta">撮影日時(Exif)から、最も早い日を「1日目」、それ以外を「2日目」として自動判定します。同じ地点(指定距離以内)で撮られた2日目の写真は、1日目と同じピン番号になります。</p>
+        <p class="meta">撮影日時(Exif)の間隔が指定時間以上空いたところで「1回目」「2回目」に自動的に分けます（同じ日でも間隔が空けば別回として扱います）。同じ地点(指定距離以内)で撮られた2回目の写真は、1回目と同じピン番号になります。</p>
+        <label title="撮影時刻の間隔がこの時間(時間)以上空いたら別回とみなす">
+          <span class="labelRow">別回とみなす間隔<span class="valWrap"><input type="number" id="dayCompareGapHours" class="valInput" min="0.1" max="720" step="0.5" value="2">時間</span></span>
+        </label>
         <label title="この距離(m)以内なら同じ地点とみなす">
           <span class="labelRow">同一地点とみなす距離<span class="valWrap"><input type="number" id="dayCompareThreshold" class="valInput" min="0" max="100" step="0.1" value="1">m</span></span>
         </label>
