@@ -24,6 +24,7 @@
         </div>
         <div id="viewerHint" class="hint">PDFと写真を読み込むと、ここに図面と写真ピンが表示されます。</div>
       </div>
+      <div id="compareView" class="compareView" hidden></div>
       <div id="calibHint" class="hint" hidden></div>
       <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。</div>
     </section>
@@ -36,20 +37,21 @@
       <section class="settingBlock color-1">
         <h2><span class="num">1</span>プロジェクト</h2>
         <div class="buttonRow">
-          <button type="button" id="saveProjectBtn" class="primary">保存</button>
           <button type="button" id="loadProjectBtn" class="primary">読込</button>
+          <button type="button" id="saveOverwriteBtn" class="primary">保存(上書)</button>
+          <button type="button" id="saveAsBtn" class="primary">保存(名前を付けて)</button>
         </div>
         <input type="file" id="projectInput" accept=".json" hidden>
-        <div class="meta">読込みには保存時に作られた「project.json」を選択してください。</div>
+        <div class="meta">読込みにはプロジェクトのフォルダを選択してください。「保存(上書)」は直前に読込み・保存したフォルダにそのまま上書きします。</div>
         <div id="projectStatus" class="meta"></div>
       </section>
 
       <section class="settingBlock color-2">
         <h2><span class="num">2</span>PDF図面</h2>
         <div id="pdfDrop" class="dropzone">
-          <p>PDFをドラッグ＆ドロップ<br>（複数ページ対応）</p>
+          <p>PDFをドラッグ＆ドロップ<br>（複数ファイル・複数ページ対応。追加で取り込むと末尾に追加されます）</p>
           <button type="button" id="pdfPickBtn">ファイルを選択</button>
-          <input type="file" id="pdfInput" accept="application/pdf" hidden>
+          <input type="file" id="pdfInput" accept="application/pdf" multiple hidden>
         </div>
         <div id="pdfMeta" class="meta"></div>
 
@@ -70,6 +72,11 @@
         <div id="pageListBlock" hidden>
           <h3>ページ一覧</h3>
           <div id="pageList" class="pageList"></div>
+        </div>
+
+        <div id="pageTrashBlock" hidden>
+          <h3>ページのゴミ箱 <span id="pageTrashCount"></span></h3>
+          <div id="pageTrashList" class="pageList"></div>
         </div>
       </section>
 
@@ -124,6 +131,13 @@
           <span class="labelRow">引き出し線の太さ<span class="valWrap"><input type="number" id="leaderWidthVal" class="valInput" min="0.2" max="8" step="0.1" value="1.4">px</span></span>
           <input type="range" id="leaderWidth" min="0.2" max="8" step="0.1" value="1.4">
         </label>
+        <label title="ピンから写真サムネイルまでの引き出し線の長さ">
+          <span class="labelRow">引き出し線の長さ<span class="valWrap"><input type="number" id="leaderLengthVal" class="valInput" min="0" max="60" step="1" value="4">px</span></span>
+          <input type="range" id="leaderLength" min="0" max="60" step="1" value="4">
+        </label>
+        <label title="引き出し線の色">
+          <span class="labelRow">引き出し線の色<span class="valWrap"><input type="color" id="leaderColor" value="#2563eb"></span></span>
+        </label>
         <label title="撮影方向を示す矢印の太さ">
           <span class="labelRow">矢印の太さ<span class="valWrap"><input type="number" id="arrowWidthVal" class="valInput" min="0.5" max="10" step="0.5" value="2">px</span></span>
           <input type="range" id="arrowWidth" min="0.5" max="10" step="0.5" value="2">
@@ -151,6 +165,19 @@
         <div id="exportStatus" class="meta"></div>
       </section>
 
+      <section class="settingBlock color-5">
+        <h2><span class="num">5</span>日付比較</h2>
+        <p class="meta">撮影日時(Exif)から、最も早い日を「1日目」、それ以外を「2日目」として自動判定します。同じ地点(指定距離以内)で撮られた2日目の写真は、1日目と同じピン番号になります。</p>
+        <label title="この距離(m)以内なら同じ地点とみなす">
+          <span class="labelRow">同一地点とみなす距離<span class="valWrap"><input type="number" id="dayCompareThreshold" class="valInput" min="0" max="100" step="0.1" value="1">m</span></span>
+        </label>
+        <div class="buttonRow">
+          <button type="button" id="dayCompareRunBtn" class="primary">照合する</button>
+          <button type="button" id="dayCompareViewBtn" class="primary">比較ページを表示</button>
+        </div>
+        <div id="dayCompareStatus" class="meta"></div>
+      </section>
+
     </aside>
 
   </div>
@@ -168,6 +195,16 @@
       <label>引き出し線太さ</label>
       <input type="number" id="pdLeaderWidth" min="0.2" max="8" step="0.1">
       <button type="button" data-reset="leaderWidthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>引き出し線長さ</label>
+      <input type="number" id="pdLeaderLength" min="0" max="60" step="1">
+      <button type="button" data-reset="leaderLengthOverride">既定</button>
+    </div>
+    <div class="pdRow">
+      <label>引き出し線色</label>
+      <input type="color" id="pdLeaderColor">
+      <button type="button" data-reset="leaderColorOverride">既定</button>
     </div>
     <div class="pdRow">
       <label>矢印太さ</label>

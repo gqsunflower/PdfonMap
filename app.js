@@ -28,10 +28,16 @@ const state = {
   pdfBytesForExport: null,
   pdfName: "",
   numPages: 0,
-  currentPage: 0, // 0-indexed
-  pageView: new Map(),      // pageIndex -> { zoom(%), rotation(deg,0/90/180/270) }
-  pageTransform: new Map(), // pageIndex -> { scale, rotationDeg, offsetX, offsetY }
+  currentPage: 0, // 0-indexed。常に合成後PDF内での物理ページ番号(srcIndex)を指す
+  pageView: new Map(),      // srcIndex -> { zoom(%), rotation(deg,0/90/180/270) }
+  pageTransform: new Map(), // srcIndex -> { scale, rotationDeg, offsetX, offsetY }
   pageViewport: null,       // 現在描画中ページの pdf.js viewport (canvas座標系の基準)
+
+  // ページの表示順とゴミ箱状態。{srcIndex, trashed} の配列で、並びが「ページ一覧」の表示順。
+  // srcIndexは合成後PDF内での物理ページ番号で、並べ替え・ゴミ箱に入れても不変
+  // (pageView/pageTransform/photo.pageIndexは常にこのsrcIndexをキーにする)。
+  pages: [],
+  pdfSources: [], // 取り込んだPDFファイルの履歴 [{name, pageCount}]（表示用）
 
   photos: [],  // { id, file, name, thumbDataUrl, lat, lon, hasGps, pageIndex, baseX, baseY, manualOffset:{x,y}|null }
   nextPhotoId: 1,
@@ -39,6 +45,8 @@ const state = {
   thumbSize: 70,
   pinSize: 9,
   leaderLineWidth: 1.4,
+  leaderLineLength: 4,
+  leaderLineColor: "#2563eb",
   arrowWidth: 2,
   arrowLength: 24,
   arrowColor: "#16a34a",
@@ -57,6 +65,13 @@ const state = {
 
   selectedPhotoIds: [], // 一覧で複数選択中の写真id（一括ページ移動・一括削除用）
   lastClickedPhotoId: null, // shift+クリックの範囲選択の基点
+
+  currentProjectDirHandle: null, // 直前に読込み/保存したプロジェクトフォルダ(FileSystemDirectoryHandle)。「保存(上書)」用
+  currentProjectName: null,
+
+  // ---- 日付比較(1日目/2日目の同一地点写真の突き合わせ) ----
+  dayCompareThreshold: 1, // 同じ地点とみなす距離(m)
+  dayCompareRows: [],     // [{ day1Id, candidateIds: [day2Id,...] }] 1日目の各写真ごとの2日目候補(手動で間引く)
 };
 
 const el = (id) => document.getElementById(id);
@@ -66,8 +81,14 @@ function init() {
   wireDropzone(el("pdfDrop"), el("pdfInput"), el("pdfPickBtn"), onPdfFiles);
   wireDropzone(el("photoDrop"), el("photoInput"), el("photoPickBtn"), onPhotoFiles);
 
-  el("prevPageBtn").addEventListener("click", () => gotoPage(state.currentPage - 1));
-  el("nextPageBtn").addEventListener("click", () => gotoPage(state.currentPage + 1));
+  el("prevPageBtn").addEventListener("click", () => {
+    const target = adjacentVisiblePage(state.currentPage, -1);
+    if (target != null) gotoPage(target);
+  });
+  el("nextPageBtn").addEventListener("click", () => {
+    const target = adjacentVisiblePage(state.currentPage, 1);
+    if (target != null) gotoPage(target);
+  });
 
   wireRangeWithNumber("pdfZoom", "pdfZoomVal", (val) => {
     if (setPageZoom(state.currentPage, val)) syncLayerControlsToCurrentPage();
@@ -77,6 +98,7 @@ function init() {
     const v = getPageView(state.currentPage);
     v.rotation = val;
     applyCanvasTransform();
+    renderPins(); // ピンの描画位置はこの回転角ぶん逆算しているため、値が変わるたび再描画が必要
   });
 
   el("layerScale").addEventListener("input", (e) => {
@@ -154,6 +176,14 @@ function init() {
     state.leaderLineWidth = val;
     renderPins();
   });
+  wireRangeWithNumber("leaderLength", "leaderLengthVal", (val) => {
+    state.leaderLineLength = val;
+    renderPins();
+  });
+  el("leaderColor").addEventListener("input", (e) => {
+    state.leaderLineColor = e.target.value;
+    renderPins();
+  });
   wireRangeWithNumber("arrowWidth", "arrowWidthVal", (val) => {
     state.arrowWidth = val;
     renderPins();
@@ -191,7 +221,18 @@ function init() {
   el("exportPdfBtn").addEventListener("click", exportCompositePdf);
   el("exportExcelBtn").addEventListener("click", exportExcel);
 
-  el("saveProjectBtn").addEventListener("click", saveProject);
+  el("dayCompareThreshold").addEventListener("change", (e) => {
+    const v = Number(e.target.value);
+    if (!isNaN(v) && v >= 0) state.dayCompareThreshold = v;
+  });
+  el("dayCompareRunBtn").addEventListener("click", () => {
+    if (!state.pdfDoc) { alert("先にPDFを読み込んでください。"); return; }
+    runDayComparison();
+  });
+  el("dayCompareViewBtn").addEventListener("click", gotoComparePage);
+
+  el("saveOverwriteBtn").addEventListener("click", saveProjectOverwrite);
+  el("saveAsBtn").addEventListener("click", saveProjectAs);
   el("loadProjectBtn").addEventListener("click", startLoadProject);
   el("projectInput").addEventListener("change", (e) => {
     const file = e.target.files[0];
@@ -229,12 +270,14 @@ function onCanvasWheel(e) {
   const scroller = el("canvasScroll");
   const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 1;
   const atTop = scroller.scrollTop <= 0;
-  if (e.deltaY > 0 && atBottom && state.currentPage < state.numPages - 1) {
+  const nextPageIndex = adjacentVisiblePage(state.currentPage, 1);
+  const prevPageIndex = adjacentVisiblePage(state.currentPage, -1);
+  if (e.deltaY > 0 && atBottom && nextPageIndex != null) {
     e.preventDefault();
-    goToAdjacentPageViaScroll(1);
-  } else if (e.deltaY < 0 && atTop && state.currentPage > 0) {
+    goToAdjacentPageViaScroll(nextPageIndex, 1);
+  } else if (e.deltaY < 0 && atTop && prevPageIndex != null) {
     e.preventDefault();
-    goToAdjacentPageViaScroll(-1);
+    goToAdjacentPageViaScroll(prevPageIndex, -1);
   }
   // それ以外は既定の縦(横)スクロール動作に任せる
 }
@@ -280,8 +323,8 @@ function rescaleLayerForZoom(pageIndex, factor) {
   // レイヤー変換(t.scale/rotationDeg)を通じて自動的に一緒にスケールされる。
 }
 
-async function goToAdjacentPageViaScroll(direction) {
-  await gotoPage(state.currentPage + direction);
+async function goToAdjacentPageViaScroll(targetPageIndex, direction) {
+  await gotoPage(targetPageIndex);
   const scroller = el("canvasScroll");
   scroller.scrollTop = direction > 0 ? 0 : scroller.scrollHeight;
 }
@@ -325,6 +368,27 @@ function getPageView(pageIndex) {
   if (!state.pageView.has(pageIndex)) state.pageView.set(pageIndex, { zoom: 100, rotation: 0 });
   return state.pageView.get(pageIndex);
 }
+
+// ---------- ページの表示順・ゴミ箱(state.pages) ----------
+// ゴミ箱に入っていないページだけを、現在の表示順で返す
+function visiblePages() {
+  return state.pages.filter((pg) => !pg.trashed);
+}
+// srcIndexで指定したページから見て、表示順でdirection(+1/-1)隣にある
+// ゴミ箱でないページのsrcIndexを返す。存在しなければnull。
+function adjacentVisiblePage(srcIndex, direction) {
+  const visible = visiblePages();
+  const pos = visible.findIndex((pg) => pg.srcIndex === srcIndex);
+  if (pos < 0) return null;
+  const next = visible[pos + direction];
+  return next ? next.srcIndex : null;
+}
+// srcIndexのページが一覧上で何番目(1始まり)に表示されているかを返す。
+// ゴミ箱に入っている場合はnull。出力(PDF/Excel)の「ページN」表記に使う。
+function displayPageNumber(srcIndex) {
+  const pos = visiblePages().findIndex((pg) => pg.srcIndex === srcIndex);
+  return pos < 0 ? null : pos + 1;
+}
 // スライダー(-300..300) <-> 倍率。0 = ×1、+300 = ×約20、-300 = ×約0.05 の対数スケール
 function sliderToScale(v) { return Math.pow(10, v / 150); }
 function scaleToSlider(s) { return Math.log10(s) * 150; }
@@ -347,6 +411,9 @@ function wireRangeWithNumber(rangeId, numberId, onChange) {
 function applyCanvasTransform() {
   const v = getPageView(state.currentPage);
   el("canvasStack").style.transform = `rotate(${v.rotation || 0}deg)`;
+  // pinCanvasは親(canvasStack)と逆方向に回転させて相殺し、見た目は常にまっすぐ(回転なし)に保つ。
+  // ピンの位置自体はrenderPins内でこの回転角ぶん逆算して描画するため、図面と一緒に正しい位置に表示される。
+  el("pinCanvas").style.transform = `rotate(${-(v.rotation || 0)}deg)`;
 }
 
 // ---------- ドラッグ&ドロップ共通 ----------
@@ -364,40 +431,165 @@ function wireDropzone(zoneEl, inputEl, btnEl, onFiles) {
 }
 
 // ---------- PDF読込 ----------
+// 複数のPDF(それぞれ複数ページ可)を取り込める。既にPDFを読み込み済みの場合は
+// 後から取り込んだページを末尾に追加する(既存ページの設定・写真配置はそのまま維持)。
 async function onPdfFiles(files) {
-  const file = files.find((f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name));
-  if (!file) { alert("PDFファイルを選択してください。"); return; }
-  const buf = await file.arrayBuffer();
-  state.pdfBytesForExport = buf.slice(0);
-  state.pdfName = file.name;
+  const pdfFiles = files.filter((f) => f.type === "application/pdf" || /\.pdf$/i.test(f.name));
+  if (!pdfFiles.length) { alert("PDFファイルを選択してください。"); return; }
 
-  const loadingTask = pdfjsLib.getDocument({ data: buf.slice(0) });
+  const { PDFDocument } = PDFLib;
+  const isFirstImport = !state.pdfDoc;
+  const mergedDoc = state.pdfBytesForExport
+    ? await PDFDocument.load(state.pdfBytesForExport)
+    : await PDFDocument.create();
+
+  let firstNewSrcIndex = null;
+  for (const file of pdfFiles) {
+    let srcDoc;
+    try {
+      srcDoc = await PDFDocument.load(await file.arrayBuffer());
+    } catch (err) {
+      console.error(err);
+      alert(`「${file.name}」はPDFとして読み込めませんでした。`);
+      continue;
+    }
+    const copiedPages = await mergedDoc.copyPages(srcDoc, srcDoc.getPageIndices());
+    const startSrcIndex = mergedDoc.getPageCount();
+    if (firstNewSrcIndex == null) firstNewSrcIndex = startSrcIndex;
+    copiedPages.forEach((p, i) => {
+      mergedDoc.addPage(p);
+      state.pages.push({ srcIndex: startSrcIndex + i, trashed: false });
+    });
+    state.pdfSources.push({ name: file.name, pageCount: copiedPages.length });
+  }
+  if (firstNewSrcIndex == null) return; // すべて読み込みに失敗した
+
+  const mergedBytes = await mergedDoc.save();
+  state.pdfBytesForExport = mergedBytes.slice(0);
+  state.pdfName = state.pdfSources.length === 1
+    ? state.pdfSources[0].name
+    : baseNameNoExt(state.pdfSources[0].name) + "_他" + (state.pdfSources.length - 1) + "件";
+
+  const loadingTask = pdfjsLib.getDocument({ data: mergedBytes.slice(0) });
   state.pdfDoc = await loadingTask.promise;
   state.numPages = state.pdfDoc.numPages;
-  state.currentPage = 0;
-  state.pageView.clear();
-  state.pageTransform.clear();
 
-  el("pdfMeta").textContent = `${file.name}\n${state.numPages} ページ`;
+  el("pdfMeta").textContent =
+    `${state.pdfSources.map((s) => s.name).join("、")}\n合計 ${state.numPages} ページ（${state.pdfSources.length}個のPDF）`;
   el("pageListBlock").hidden = false;
   el("viewerHint").hidden = true;
   buildPageList();
-  await gotoPage(0);
+  await gotoPage(isFirstImport ? firstNewSrcIndex : state.currentPage);
 }
 
 function buildPageList() {
   const box = el("pageList");
   box.innerHTML = "";
-  for (let i = 0; i < state.numPages; i++) {
+  const visible = visiblePages();
+  visible.forEach((pg, i) => {
+    const pageIndex = pg.srcIndex;
     const row = document.createElement("div");
-    row.className = "pageThumb" + (i === state.currentPage ? " active" : "");
-    row.innerHTML = `<span>ページ ${i + 1}</span><span class="count">${countPhotosOnPage(i)}枚</span><button type="button" class="renumberBtn" title="このページのピン番号を振り直す(1,2,3…)">🔢</button>`;
-    row.addEventListener("click", () => gotoPage(i));
+    row.className = "pageThumb" + (pageIndex === state.currentPage ? " active" : "");
+    row.innerHTML = `<span>ページ ${i + 1}</span><span class="count">${countPhotosOnPage(pageIndex)}枚</span>` +
+      `<button type="button" class="pageMoveBtn" data-dir="-1" title="前に入れ替え"${i === 0 ? " disabled" : ""}>▲</button>` +
+      `<button type="button" class="pageMoveBtn" data-dir="1" title="後ろに入れ替え"${i === visible.length - 1 ? " disabled" : ""}>▼</button>` +
+      `<button type="button" class="renumberBtn" title="このページのピン番号を振り直す(1,2,3…)">🔢</button>` +
+      `<button type="button" class="pageTrashBtn" title="このページをゴミ箱へ移動">🗑</button>`;
+    row.addEventListener("click", () => gotoPage(pageIndex));
     row.querySelector(".renumberBtn").addEventListener("click", (e) => {
       e.stopPropagation();
-      renumberPage(i);
+      renumberPage(pageIndex);
+    });
+    row.querySelectorAll(".pageMoveBtn").forEach((btn) => {
+      btn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        movePageInOrder(pageIndex, Number(btn.dataset.dir));
+      });
+    });
+    row.querySelector(".pageTrashBtn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      trashPage(pageIndex);
     });
     box.appendChild(row);
+  });
+
+  // 日付比較ページ(実際のPDFページではない仮想ページ)。常に一覧の最後に表示する。
+  if (visible.length) {
+    const compareRow = document.createElement("div");
+    compareRow.className = "pageThumb" + (state.currentPage === "compare" ? " active" : "");
+    compareRow.innerHTML = `<span>📊 日付比較ページ</span>`;
+    compareRow.addEventListener("click", () => gotoComparePage());
+    box.appendChild(compareRow);
+  }
+
+  const trashed = state.pages.filter((pg) => pg.trashed);
+  el("pageTrashBlock").hidden = trashed.length === 0;
+  el("pageTrashCount").textContent = trashed.length ? `(${trashed.length})` : "";
+  const trashBox = el("pageTrashList");
+  trashBox.innerHTML = "";
+  trashed.forEach((pg) => {
+    const row = document.createElement("div");
+    row.className = "pageThumb";
+    row.innerHTML = `<span>ページ（写真${countPhotosOnPage(pg.srcIndex)}枚）</span>` +
+      `<button type="button" class="restoreBtn">復元</button>`;
+    row.querySelector(".restoreBtn").addEventListener("click", () => restorePage(pg.srcIndex));
+    trashBox.appendChild(row);
+  });
+}
+
+// ページの表示順を、隣接するゴミ箱でないページと入れ替える(direction: -1=前へ, 1=後ろへ)
+function movePageInOrder(srcIndex, direction) {
+  const fullIdx = state.pages.findIndex((pg) => pg.srcIndex === srcIndex);
+  if (fullIdx < 0) return;
+  let neighborIdx = fullIdx + direction;
+  while (neighborIdx >= 0 && neighborIdx < state.pages.length && state.pages[neighborIdx].trashed) {
+    neighborIdx += direction;
+  }
+  if (neighborIdx < 0 || neighborIdx >= state.pages.length) return;
+  const tmp = state.pages[fullIdx];
+  state.pages[fullIdx] = state.pages[neighborIdx];
+  state.pages[neighborIdx] = tmp;
+  buildPageList();
+}
+
+// ページをゴミ箱へ移動する。写真配置やページ自体のデータは削除せず保持したまま、
+// ページ一覧・ナビゲーション・出力からだけ除外する(「復元」でいつでも元に戻せる)。
+function trashPage(srcIndex) {
+  const pg = state.pages.find((p) => p.srcIndex === srcIndex);
+  if (!pg) return;
+  const photoCount = countPhotosOnPage(srcIndex);
+  if (photoCount > 0 && !confirm(`このページには写真が${photoCount}枚配置されています。ゴミ箱へ移動しますか？\n(写真の配置情報は保持され、「復元」でいつでも元に戻せます)`)) {
+    return;
+  }
+  pg.trashed = true;
+  if (state.currentPage === srcIndex) {
+    const next = visiblePages()[0];
+    if (next) {
+      gotoPage(next.srcIndex);
+    } else {
+      state.currentPage = -1;
+      el("pdfCanvas").getContext("2d").clearRect(0, 0, el("pdfCanvas").width, el("pdfCanvas").height);
+      el("pinCanvas").getContext("2d").clearRect(0, 0, el("pinCanvas").width, el("pinCanvas").height);
+      el("pageIndicator").textContent = "- / -";
+      el("viewerHint").hidden = false;
+      buildPageList();
+      renderPhotoList();
+    }
+  } else {
+    buildPageList();
+    renderPhotoList();
+  }
+}
+function restorePage(srcIndex) {
+  const pg = state.pages.find((p) => p.srcIndex === srcIndex);
+  if (!pg) return;
+  pg.trashed = false;
+  if (state.currentPage < 0) {
+    el("viewerHint").hidden = true;
+    gotoPage(srcIndex);
+  } else {
+    buildPageList();
+    renderPhotoList();
   }
 }
 
@@ -416,9 +608,13 @@ function countPhotosOnPage(pageIndex) {
 
 async function gotoPage(index) {
   if (!state.pdfDoc) return;
-  if (index < 0 || index >= state.numPages) return;
+  const visible = visiblePages();
+  const pos = visible.findIndex((pg) => pg.srcIndex === index);
+  if (pos < 0) return; // ゴミ箱に入っている、または存在しないページ
+  el("compareView").hidden = true;
+  el("canvasScroll").hidden = false;
   state.currentPage = index;
-  el("pageIndicator").textContent = `${index + 1} / ${state.numPages}`;
+  el("pageIndicator").textContent = `${pos + 1} / ${visible.length}`;
   const v = getPageView(index);
   el("pdfZoom").value = v.zoom;
   el("pdfZoomVal").value = v.zoom;
@@ -428,6 +624,100 @@ async function gotoPage(index) {
   buildPageList();
   await renderPage();
   renderPhotoList();
+}
+
+// 日付比較ページ(実際のPDFページを持たない仮想ページ)を表示する
+function gotoComparePage() {
+  if (!state.pdfDoc) return;
+  state.currentPage = "compare";
+  el("canvasScroll").hidden = true;
+  el("compareView").hidden = false;
+  el("pageIndicator").textContent = "比較";
+  buildPageList();
+  renderComparePage();
+  renderPhotoList();
+}
+
+function comparePhotoCardHtml(photo, label) {
+  const color = photo.pinColor || DEFAULT_PIN_COLOR;
+  return `<img src="${photo.thumbDataUrl}" alt="">` +
+    `<div class="pinBadge" style="background:${color}; color:${contrastTextColor(color)}">${label}</div>` +
+    `<div class="name" title="${photo.name}">${photo.name}</div>`;
+}
+
+// 「日付比較ページ」の中身を組み立てる。左=1日目、右=その候補(2日目)を縦に並べる。
+function renderComparePage() {
+  const box = el("compareView");
+  if (!box) return;
+  box.innerHTML = "";
+  const { day1Key, day2Keys, day1Photos, day2Photos } = dayGroups();
+
+  if (!day1Key) {
+    box.innerHTML = `<div class="hint">撮影日時(Exif)付きのGPS写真が見つかりません。日付比較には撮影日時の入った写真が必要です。</div>`;
+    return;
+  }
+
+  const info = document.createElement("div");
+  info.className = "hint";
+  info.textContent = `1日目：${day1Key}（${day1Photos.length}枚） / 2日目以降：${day2Keys.join("、") || "-"}（${day2Photos.length}枚）`;
+  box.appendChild(info);
+
+  const sortedDay1 = [...day1Photos].sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
+  const matchedDay2Ids = new Set();
+
+  sortedDay1.forEach((d1) => {
+    const row = state.dayCompareRows.find((r) => r.day1Id === d1.id) || { candidateIds: [] };
+    row.candidateIds.forEach((id) => matchedDay2Ids.add(id));
+
+    const rowEl = document.createElement("div");
+    rowEl.className = "compareRow";
+    const leftCell = document.createElement("div");
+    leftCell.className = "compareCell compareLeft";
+    const leftCard = document.createElement("div");
+    leftCard.className = "comparePhotoCard";
+    leftCard.innerHTML = comparePhotoCardHtml(d1, labelOfPhoto(d1));
+    leftCell.appendChild(leftCard);
+
+    const rightCell = document.createElement("div");
+    rightCell.className = "compareCell compareRight";
+    if (!row.candidateIds.length) {
+      rightCell.innerHTML = `<div class="hint">候補なし</div>`;
+    }
+    row.candidateIds.forEach((cid) => {
+      const d2 = state.photos.find((p) => p.id === cid);
+      if (!d2) return;
+      const card = document.createElement("div");
+      card.className = "comparePhotoCard";
+      card.innerHTML = comparePhotoCardHtml(d2, d2.numberLabel) +
+        `<button type="button" class="removeBtn" title="候補から外す">×</button>`;
+      card.querySelector(".removeBtn").addEventListener("click", () => removeDayCompareCandidate(d1.id, cid));
+      rightCell.appendChild(card);
+    });
+
+    rowEl.appendChild(leftCell);
+    rowEl.appendChild(rightCell);
+    box.appendChild(rowEl);
+  });
+
+  const newOnes = day2Photos.filter((p) => !matchedDay2Ids.has(p.id))
+    .sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
+  if (newOnes.length) {
+    const sec = document.createElement("div");
+    sec.className = "compareNewSection";
+    const title = document.createElement("h4");
+    title.textContent = "新規番号（1日目に該当地点なし）";
+    sec.appendChild(title);
+    const wrap = document.createElement("div");
+    wrap.className = "compareNewWrap";
+    newOnes.forEach((p) => {
+      const card = document.createElement("div");
+      card.className = "comparePhotoCard";
+      card.innerHTML = comparePhotoCardHtml(p, labelOfPhoto(p));
+      wrap.appendChild(card);
+    });
+    sec.appendChild(wrap);
+    box.appendChild(sec);
+  }
 }
 
 let currentRenderTask = null;
@@ -485,6 +775,13 @@ async function onPhotoFiles(files) {
 async function addPhoto(file) {
   let gps = null;
   try { gps = await exifr.gps(file); } catch (e) { gps = null; }
+  let capturedAt = null;
+  try {
+    const exifData = await exifr.parse(file, { pick: ["DateTimeOriginal", "CreateDate"] });
+    const raw = exifData && (exifData.DateTimeOriginal || exifData.CreateDate);
+    if (raw) capturedAt = raw instanceof Date ? raw : new Date(raw);
+    if (capturedAt && isNaN(capturedAt.getTime())) capturedAt = null;
+  } catch (e) { capturedAt = null; }
 
   const thumbDataUrl = await makeThumbnail(file, 320);
 
@@ -496,7 +793,10 @@ async function addPhoto(file) {
     lat: gps ? gps.latitude : null,
     lon: gps ? gps.longitude : null,
     hasGps: !!gps,
-    pageIndex: state.currentPage,
+    capturedAt, // Exif撮影日時(Date|null)。日付比較機能(1日目/2日目の自動グループ分け)に使う
+    pageIndex: typeof state.currentPage === "number" && state.currentPage >= 0
+      ? state.currentPage
+      : (visiblePages()[0] ? visiblePages()[0].srcIndex : 0),
     baseX: 0, baseY: 0,
     manualOffset: null,  // {x,y}|null。baseX/baseYと同じ基準座標系での手動位置調整分
     numberLabel: null,   // null = 自動採番（一覧順）。手動変更するとその文字列を表示
@@ -506,6 +806,8 @@ async function addPhoto(file) {
     // 以下は null なら一括設定(state.pinSize等)に従い、値があればこの写真だけ個別に上書きする
     pinSizeOverride: null,
     leaderWidthOverride: null,
+    leaderLengthOverride: null,
+    leaderColorOverride: null,
     arrowWidthOverride: null,
     arrowLengthOverride: null,
     arrowColorOverride: null,
@@ -576,6 +878,94 @@ function labelOfPhoto(p) {
   return p.numberLabel != null ? p.numberLabel : String(getActivePhotos().indexOf(p) + 1);
 }
 
+// ---------- 日付比較(1日目/2日目の同一地点写真の突き合わせ) ----------
+// Exif撮影日時の「年-月-日」部分。日時が無い写真はnull(比較の対象外)。
+function photoDateKey(photo) {
+  const d = photo.capturedAt;
+  if (!d) return null;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+// 撮影日時のある GPS 写真を、最も早い日付(1日目)とそれ以外(2日目)に分ける
+function dayGroups() {
+  const gpsPhotos = getActivePhotos().filter((p) => p.hasGps && photoDateKey(p));
+  const keys = [...new Set(gpsPhotos.map(photoDateKey))].sort();
+  const day1Key = keys[0] || null;
+  return {
+    day1Key,
+    day2Keys: keys.slice(1),
+    day1Photos: gpsPhotos.filter((p) => photoDateKey(p) === day1Key),
+    day2Photos: gpsPhotos.filter((p) => photoDateKey(p) !== day1Key),
+  };
+}
+// baseX/baseYは全写真共通の1つの基準点からの平面座標(m換算)なので、
+// 撮影ページが違っても単純なユークリッド距離で実距離(m)とみなせる。
+function photoDistanceMeters(a, b) {
+  return Math.hypot(a.baseX - b.baseX, a.baseY - b.baseY);
+}
+// 1日目の各写真ごとに、指定距離(state.dayCompareThreshold)以内にある2日目の写真を
+// 候補として洗い出す。既存の手動での候補削除は再照合すると失われる(やり直し)。
+function runDayComparison() {
+  const { day1Photos, day2Photos } = dayGroups();
+  const threshold = state.dayCompareThreshold;
+  const sortedDay1 = [...day1Photos].sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
+  state.dayCompareRows = sortedDay1.map((d1) => {
+    const candidateIds = day2Photos
+      .filter((d2) => photoDistanceMeters(d1, d2) <= threshold)
+      .sort((a, b) => photoDistanceMeters(d1, a) - photoDistanceMeters(d1, b))
+      .map((d2) => d2.id);
+    return { day1Id: d1.id, candidateIds };
+  });
+  applyDayCompareLabels();
+  renderPhotoList();
+  renderPins();
+  renderComparePage();
+  updateDayCompareStatus();
+}
+// 候補一覧から不要なものを手動で外す(そのページの照合結果からのみ除外。他の1日目写真の
+// 候補に同じ写真が残っていればそちらは影響しない)
+function removeDayCompareCandidate(day1Id, day2Id) {
+  const row = state.dayCompareRows.find((r) => r.day1Id === day1Id);
+  if (!row) return;
+  row.candidateIds = row.candidateIds.filter((id) => id !== day2Id);
+  applyDayCompareLabels();
+  renderPhotoList();
+  renderPins();
+  renderComparePage();
+  updateDayCompareStatus();
+}
+// 現在のstate.dayCompareRows(候補を手動で間引いた結果)に基づき、2日目の写真のピン番号を
+// 実際に書き換える。マッチしたものは1日目と同じ番号、マッチしなかったものは
+// (1日目の最大番号+1)から新規に連番を振る。1日目の番号自体は一切変更しない。
+function applyDayCompareLabels() {
+  const { day1Photos, day2Photos } = dayGroups();
+  const matchedMap = new Map(); // day2Id -> label
+  for (const row of state.dayCompareRows) {
+    const day1Photo = state.photos.find((p) => p.id === row.day1Id);
+    if (!day1Photo) continue;
+    const label = labelOfPhoto(day1Photo);
+    for (const cid of row.candidateIds) {
+      if (!matchedMap.has(cid)) matchedMap.set(cid, label);
+    }
+  }
+  const usedNumeric = day1Photos.map((p) => Number(labelOfPhoto(p))).filter((n) => !Number.isNaN(n));
+  let nextNew = (usedNumeric.length ? Math.max(...usedNumeric) : 0) + 1;
+  for (const p of day2Photos) {
+    p.numberLabel = matchedMap.has(p.id) ? matchedMap.get(p.id) : String(nextNew++);
+  }
+}
+function updateDayCompareStatus() {
+  const box = el("dayCompareStatus");
+  if (!box) return;
+  const { day1Key, day2Keys, day1Photos, day2Photos } = dayGroups();
+  if (!day1Key) {
+    box.textContent = "撮影日時(Exif)付きのGPS写真がありません。";
+    return;
+  }
+  const matched = state.dayCompareRows.reduce((s, r) => s + r.candidateIds.length, 0);
+  box.textContent = `1日目(${day1Key})：${day1Photos.length}枚 / 2日目以降(${day2Keys.join("、") || "-"})：${day2Photos.length}枚\n` +
+    `マッチ済み：${matched}件 / 新規番号：${day2Photos.length - matched}枚`;
+}
+
 // ---------- 写真一覧UI ----------
 function renderPhotoList() {
   const box = el("photoList");
@@ -608,7 +998,7 @@ function renderPhotoList() {
         <div class="name" title="${p.name}">${p.name}</div>
         <div class="gps">${p.hasGps ? `${p.lat.toFixed(6)}, ${p.lon.toFixed(6)}` : "GPS情報なし"}</div>
       </div>
-      <span class="pageBadge" style="${pageBadgeStyle(p.pageIndex)}" title="右クリックで移動先ページを選択、またはゴミ箱へ移動">P${p.pageIndex + 1}</span>
+      <span class="pageBadge" style="${pageBadgeStyle(p.pageIndex)}" title="右クリックで移動先ページを選択、またはゴミ箱へ移動">P${displayPageNumber(p.pageIndex) || "?"}</span>
       <button type="button" data-del="${p.id}" title="ゴミ箱へ移動">×</button>
     `;
     if (!state.calibrating) {
@@ -771,6 +1161,17 @@ function getBaseBBox(photos) {
     minY: Math.min(...ys), maxY: Math.max(...ys),
   };
 }
+// 手動位置調整分(manualOffset)も含めたbbox。写真レイヤーの範囲表示(drawLayerBoundsOverlay)専用。
+// レイヤー変形自体の基点/中心(anchor/center)はtransformPoint内でgetBaseBBox(生のGPS位置)を
+// 使い続けるため、ここで手動調整分を混ぜても他のピンの位置計算には影響しない。
+function getEffectiveBaseBBox(photos) {
+  const xs = photos.map((p) => p.baseX + (p.manualOffset ? p.manualOffset.x : 0));
+  const ys = photos.map((p) => p.baseY + (p.manualOffset ? p.manualOffset.y : 0));
+  return {
+    minX: Math.min(...xs), maxX: Math.max(...xs),
+    minY: Math.min(...ys), maxY: Math.max(...ys),
+  };
+}
 // p (baseX,baseY + 手動調整分) をキャンバス座標へ変換。
 // 手動で位置を微調整した写真も、baseX/baseYと同じ基準(base)座標系の
 // オフセットとして加算するだけなので、レイヤーの拡大縮小・回転・移動の
@@ -799,12 +1200,34 @@ function transformPoint(p, photosOnPage, t) {
 
 function normalizeAngle(deg) { return ((deg % 360) + 360) % 360; }
 
+// 「2.PDF図面」の回転角(pdf.js自体は回転させず、canvasStackにCSSでrotateをかけているだけ)による
+// 見た目上の回転に合わせて、位置pだけをキャンバス中心まわりに回転させる。
+// pinCanvas自体は逆回転で相殺してまっすぐ(回転なし)に保っているため、ここで位置だけ
+// 回転させて描画すれば「位置は図面と一緒に動くが、写真・ピン自体の向きはまっすぐ」になる。
+function rotateForView(p, canvas, viewRotationDeg) {
+  if (!viewRotationDeg) return p;
+  const cx = canvas.width / 2, cy = canvas.height / 2;
+  const rad = viewRotationDeg * Math.PI / 180;
+  const cos = Math.cos(rad), sin = Math.sin(rad);
+  const dx = p.x - cx, dy = p.y - cy;
+  return { x: cx + dx * cos - dy * sin, y: cy + dx * sin + dy * cos };
+}
+
 const ARROW_HEAD_LEN = 8;
 const ARROW_HEAD_ANGLE = 26; // deg
+
+// 矢印が太いほど先端の矢じりも大きくする(細いままだとただの棒に見えるため)。
+// ただし矢印本体より長くなりすぎないよう、全長の70%を上限とする。
+function arrowHeadLength(width, shaftLength) {
+  const base = Math.max(ARROW_HEAD_LEN, width * 4);
+  return Math.min(base, shaftLength * 0.7);
+}
 
 // 一括設定(state.xxx)を基本とし、写真ごとの個別上書き(xxxOverride)があればそちらを優先する
 function effPinSize(p) { return p.pinSizeOverride != null ? p.pinSizeOverride : state.pinSize; }
 function effLeaderWidth(p) { return p.leaderWidthOverride != null ? p.leaderWidthOverride : state.leaderLineWidth; }
+function effLeaderLength(p) { return p.leaderLengthOverride != null ? p.leaderLengthOverride : state.leaderLineLength; }
+function effLeaderColor(p) { return p.leaderColorOverride != null ? p.leaderColorOverride : state.leaderLineColor; }
 function effArrowWidth(p) { return p.arrowWidthOverride != null ? p.arrowWidthOverride : state.arrowWidth; }
 function effArrowLength(p) { return p.arrowLengthOverride != null ? p.arrowLengthOverride : state.arrowLength; }
 function effArrowColor(p) { return p.arrowColorOverride != null ? p.arrowColorOverride : state.arrowColor; }
@@ -812,7 +1235,9 @@ function effThumbBorderWidth(p) { return p.thumbBorderWidthOverride != null ? p.
 function effThumbBorderColor(p) { return p.thumbBorderColorOverride != null ? p.thumbBorderColorOverride : state.thumbBorderColor; }
 
 // cx,cy: ピン中心。angleDeg: 上(画面のY-)を0とし時計回りの角度。
-function arrowGeometry(cx, cy, angleDeg, length) {
+// headLen: 矢じり(先端の三角)の長さ。省略時は既定値(ARROW_HEAD_LEN)を使う。
+function arrowGeometry(cx, cy, angleDeg, length, headLen) {
+  if (headLen == null) headLen = ARROW_HEAD_LEN;
   const rad = angleDeg * Math.PI / 180;
   const dx = Math.sin(rad), dy = -Math.cos(rad);
   const tip = { x: cx + dx * length, y: cy + dy * length };
@@ -820,7 +1245,7 @@ function arrowGeometry(cx, cy, angleDeg, length) {
     const a = ARROW_HEAD_ANGLE * Math.PI / 180 * sign;
     const rdx = dx * Math.cos(a) - dy * Math.sin(a);
     const rdy = dx * Math.sin(a) + dy * Math.cos(a);
-    return { x: tip.x - rdx * ARROW_HEAD_LEN, y: tip.y - rdy * ARROW_HEAD_LEN };
+    return { x: tip.x - rdx * headLen, y: tip.y - rdy * headLen };
   };
   return { base: { x: cx, y: cy }, tip, wing1: mkWing(1), wing2: mkWing(-1) };
 }
@@ -846,7 +1271,8 @@ function renderPins() {
     t.centered = true;
   }
 
-  drawLayerBoundsOverlay(ctx, photosOnPage, t);
+  const viewRotation = getPageView(state.currentPage).rotation || 0;
+  drawLayerBoundsOverlay(ctx, photosOnPage, t, canvas, viewRotation);
 
   const activePhotos = getActivePhotos();
   const pins = state.photos
@@ -858,41 +1284,44 @@ function renderPins() {
       dir: normalizeAngle(p.directionDeg + t.rotationDeg),
     }));
 
+  // ヒットテスト/ドラッグ/PDF・Excel出力等はすべてこのpos(P空間=回転角の影響を受けない
+  // 図面本来の座標系)を基準にするため、_screenPos/_screenDirは回転前の値のまま保持する。
   pins.forEach((pin) => { pin.photo._screenPos = pin.pos; pin.photo._screenDir = pin.dir; });
 
-  for (const pin of pins) drawPin(ctx, pin);
+  // 実際の描画位置だけは、pinCanvasの逆回転(applyCanvasTransform)と打ち消し合うよう
+  // 回転角ぶん回転させる。これにより位置は図面と一緒に動くが、pinCanvas自体は
+  // まっすぐなままなので、写真・ピン・矢印の向きはまっすぐ表示される。
+  for (const pin of pins) {
+    drawPin(ctx, { ...pin, pos: rotateForView(pin.pos, canvas, viewRotation) });
+  }
   drawCalibOverlay(ctx);
 }
 
-// 写真レイヤーの範囲を示すガイド枠。基点(左下)側の辺は赤い実線、
-// 拡大縮小で動く側(上・右)の辺は黒い破線で表示する。プレビュー確認用のみで、
-// PDF/Excel出力(exportCompositePdf/exportExcel)には一切描画しない。
-function drawLayerBoundsOverlay(ctx, photosOnPage, t) {
+// 写真レイヤーの範囲を示すガイド枠。四辺すべて赤い実線で表示する。
+// プレビュー確認用のみで、PDF/Excel出力(exportCompositePdf/exportExcel)には一切描画しない。
+function drawLayerBoundsOverlay(ctx, photosOnPage, t, canvas, viewRotation) {
   if (photosOnPage.length < 2) return;
-  const bb = getBaseBBox(photosOnPage);
-  const corner = (bx, by) => transformPoint({ baseX: bx, baseY: by, manualOffset: null }, photosOnPage, t);
-  const bl = corner(bb.minX, bb.maxY); // 基点（左下）
+  // 手動で位置調整した写真があっても枠がそれを反映するよう、
+  // manualOffsetを含めた実効bboxを使う(レイヤー変形自体の基点はtransformPoint内で不変)。
+  // 描画位置はPDF図面の回転角(viewRotation)ぶんだけ回転させ、図面と一緒に動くようにする
+  // (pinCanvas自体は逆回転で相殺されまっすぐなままなので、枠と文字の向きはまっすぐ保たれる)。
+  const bb = getEffectiveBaseBBox(photosOnPage);
+  const corner = (bx, by) => rotateForView(
+    transformPoint({ baseX: bx, baseY: by, manualOffset: null }, photosOnPage, t), canvas, viewRotation);
+  const bl = corner(bb.minX, bb.maxY);
   const tl = corner(bb.minX, bb.minY);
   const tr = corner(bb.maxX, bb.minY);
   const br = corner(bb.maxX, bb.maxY);
 
   ctx.save();
-  ctx.strokeStyle = "rgba(30,30,30,0.55)";
-  ctx.lineWidth = 1.5;
-  ctx.setLineDash([6, 4]);
-  ctx.beginPath();
-  ctx.moveTo(tl.x, tl.y);
-  ctx.lineTo(tr.x, tr.y);
-  ctx.lineTo(br.x, br.y);
-  ctx.stroke();
-
-  ctx.setLineDash([]);
   ctx.strokeStyle = "#dc2626";
   ctx.lineWidth = 2;
   ctx.beginPath();
   ctx.moveTo(tl.x, tl.y);
-  ctx.lineTo(bl.x, bl.y);
+  ctx.lineTo(tr.x, tr.y);
   ctx.lineTo(br.x, br.y);
+  ctx.lineTo(bl.x, bl.y);
+  ctx.closePath();
   ctx.stroke();
   ctx.restore();
 
@@ -912,12 +1341,14 @@ function drawPin(ctx, pin) {
   const { pos, photo, index, dir } = pin;
   const r = effPinSize(photo);
   const thumb = state.thumbSize;
-  const thumbCx = pos.x + r + thumb / 2 + 4;
-  const thumbCy = pos.y - r - thumb / 2 - 4;
+  const leaderLen = effLeaderLength(photo);
+  const thumbCx = pos.x + r + thumb / 2 + leaderLen;
+  const thumbCy = pos.y - r - thumb / 2 - leaderLen;
 
   // 撮影方向の矢印
   const arrowCol = effArrowColor(photo);
-  const arrow = arrowGeometry(pos.x, pos.y, dir, effArrowLength(photo));
+  const arrowLen = effArrowLength(photo);
+  const arrow = arrowGeometry(pos.x, pos.y, dir, arrowLen, arrowHeadLength(effArrowWidth(photo), arrowLen));
   ctx.save();
   ctx.strokeStyle = arrowCol;
   ctx.fillStyle = arrowCol;
@@ -936,9 +1367,8 @@ function drawPin(ctx, pin) {
 
   // 引き出し線
   ctx.save();
-  ctx.strokeStyle = "rgba(37,99,235,0.75)";
+  ctx.strokeStyle = effLeaderColor(photo);
   ctx.lineWidth = effLeaderWidth(photo);
-  ctx.setLineDash([3, 2]);
   ctx.beginPath();
   ctx.moveTo(pos.x, pos.y);
   ctx.lineTo(thumbCx - thumb / 2 * 0.3, thumbCy + thumb / 2 * 0.3);
@@ -948,7 +1378,7 @@ function drawPin(ctx, pin) {
   // サムネイル（フチ付き）
   const img = pin.photo._imgEl || getCachedImage(photo);
   const borderW = effThumbBorderWidth(photo);
-  const inset = Math.max(2, borderW);
+  const inset = borderW / 2;
   ctx.save();
   ctx.fillStyle = "#fff";
   ctx.strokeStyle = effThumbBorderColor(photo);
@@ -1056,10 +1486,33 @@ function onCanvasMouseDown(e) {
     state.dragLast = pos;
     return;
   }
-  if (state.layerPanMode) {
+  // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
+  // それ以外でも写真レイヤーの枠(基準線)を直接つまんでドラッグすれば移動できるようにする。
+  if (state.layerPanMode || hitTestLayerBounds(pos)) {
     state.draggingLayer = true;
     state.dragLast = pos;
   }
+}
+// 現在のページの写真レイヤーの範囲(drawLayerBoundsOverlayと同じ四角形)内に
+// 画面座標posが含まれるかどうかを判定する。回転していても正しく判定できるよう、
+// 変換後の4隅を結ぶ凸四角形に対する内外判定を行う。
+function hitTestLayerBounds(pos) {
+  const photosOnPage = getPagePhotos(state.currentPage);
+  if (photosOnPage.length < 2) return false;
+  const t = getPageTransform(state.currentPage);
+  const bb = getEffectiveBaseBBox(photosOnPage);
+  const corner = (bx, by) => transformPoint({ baseX: bx, baseY: by, manualOffset: null }, photosOnPage, t);
+  const quad = [corner(bb.minX, bb.minY), corner(bb.maxX, bb.minY), corner(bb.maxX, bb.maxY), corner(bb.minX, bb.maxY)];
+  let sign = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = quad[i], b = quad[(i + 1) % 4];
+    const cross = (b.x - a.x) * (pos.y - a.y) - (b.y - a.y) * (pos.x - a.x);
+    if (cross === 0) continue;
+    const s = cross > 0 ? 1 : -1;
+    if (sign === 0) sign = s;
+    else if (s !== sign) return false;
+  }
+  return true;
 }
 function hitTestPin(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
@@ -1082,8 +1535,9 @@ function hitTestThumbnail(pos) {
     const sp = p._screenPos;
     if (!sp) continue;
     const r = effPinSize(p);
-    const thumbCx = sp.x + r + thumb / 2 + 4;
-    const thumbCy = sp.y - r - thumb / 2 - 4;
+    const leaderLen = effLeaderLength(p);
+    const thumbCx = sp.x + r + thumb / 2 + leaderLen;
+    const thumbCy = sp.y - r - thumb / 2 - leaderLen;
     if (pos.x >= thumbCx - thumb / 2 && pos.x <= thumbCx + thumb / 2
       && pos.y >= thumbCy - thumb / 2 && pos.y <= thumbCy + thumb / 2) {
       return p;
@@ -1202,14 +1656,15 @@ function showPageContextMenu(clientX, clientY, photos) {
   const multi = photos.length > 1;
   const countLabel = multi ? `${photos.length}枚を` : "";
 
-  for (let i = 0; i < Math.max(1, state.numPages); i++) {
-    const allOnThisPage = photos.every((p) => p.pageIndex === i);
+  visiblePages().forEach((pg, i) => {
+    const pageIndex = pg.srcIndex;
+    const allOnThisPage = photos.every((p) => p.pageIndex === pageIndex);
     const item = document.createElement("div");
     item.className = "ctxItem" + (allOnThisPage ? " current" : "");
     item.textContent = `${countLabel}ページ ${i + 1} へ移動` + (allOnThisPage ? "（現在のページ）" : "");
     if (!allOnThisPage) {
       item.addEventListener("click", () => {
-        photos.forEach((p) => { p.pageIndex = i; });
+        photos.forEach((p) => { p.pageIndex = pageIndex; });
         hideContextMenu();
         renderPhotoList();
         buildPageList();
@@ -1217,7 +1672,7 @@ function showPageContextMenu(clientX, clientY, photos) {
       });
     }
     menu.appendChild(item);
-  }
+  });
   const sep = document.createElement("div");
   sep.className = "ctxSep";
   menu.appendChild(sep);
@@ -1295,6 +1750,8 @@ function refreshPinDetailInputs() {
   if (!pinDetailTarget) return;
   el("pdPinSize").value = effPinSize(pinDetailTarget);
   el("pdLeaderWidth").value = effLeaderWidth(pinDetailTarget);
+  el("pdLeaderLength").value = effLeaderLength(pinDetailTarget);
+  el("pdLeaderColor").value = effLeaderColor(pinDetailTarget);
   el("pdArrowWidth").value = effArrowWidth(pinDetailTarget);
   el("pdArrowLength").value = effArrowLength(pinDetailTarget);
   el("pdArrowColor").value = effArrowColor(pinDetailTarget);
@@ -1310,6 +1767,16 @@ function initPinDetailPanel() {
   el("pdLeaderWidth").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
     pinDetailTarget.leaderWidthOverride = Number(e.target.value);
+    renderPins();
+  });
+  el("pdLeaderLength").addEventListener("input", (e) => {
+    if (!pinDetailTarget) return;
+    pinDetailTarget.leaderLengthOverride = Number(e.target.value);
+    renderPins();
+  });
+  el("pdLeaderColor").addEventListener("input", (e) => {
+    if (!pinDetailTarget) return;
+    pinDetailTarget.leaderColorOverride = e.target.value;
     renderPins();
   });
   el("pdArrowWidth").addEventListener("input", (e) => {
@@ -1475,9 +1942,15 @@ function buildProjectManifest() {
     pdfName: state.pdfName,
     pdfBase64: arrayBufferToBase64(state.pdfBytesForExport),
     currentPage: state.currentPage,
+    pages: state.pages,
+    pdfSources: state.pdfSources,
+    dayCompareThreshold: state.dayCompareThreshold,
+    dayCompareRows: state.dayCompareRows,
     thumbSize: state.thumbSize,
     pinSize: state.pinSize,
     leaderLineWidth: state.leaderLineWidth,
+    leaderLineLength: state.leaderLineLength,
+    leaderLineColor: state.leaderLineColor,
     arrowWidth: state.arrowWidth,
     arrowLength: state.arrowLength,
     arrowColor: state.arrowColor,
@@ -1493,6 +1966,7 @@ function buildProjectManifest() {
       lat: p.lat,
       lon: p.lon,
       hasGps: p.hasGps,
+      capturedAt: p.capturedAt ? p.capturedAt.toISOString() : null,
       pageIndex: p.pageIndex,
       baseX: p.baseX,
       baseY: p.baseY,
@@ -1503,6 +1977,8 @@ function buildProjectManifest() {
       pinColor: p.pinColor,
       pinSizeOverride: p.pinSizeOverride,
       leaderWidthOverride: p.leaderWidthOverride,
+      leaderLengthOverride: p.leaderLengthOverride,
+      leaderColorOverride: p.leaderColorOverride,
       arrowWidthOverride: p.arrowWidthOverride,
       arrowLengthOverride: p.arrowLengthOverride,
       arrowColorOverride: p.arrowColorOverride,
@@ -1519,7 +1995,28 @@ async function writeFile(dirHandle, name, contents) {
   await w.close();
 }
 
-async function saveProject() {
+// プロジェクトフォルダ(drawing.pdf・photos/・project.json)へ書き込む共通処理。
+// 「保存(名前を付けて)」「保存(上書)」の両方から呼ばれる。
+async function writeProjectFiles(projectDir, projectName) {
+  el("projectStatus").textContent = "保存中...";
+  await writeFile(projectDir, "drawing.pdf", state.pdfBytesForExport);
+
+  const photosDir = await projectDir.getDirectoryHandle("photos", { create: true });
+  for (const p of state.photos) {
+    const bytes = p.file ? await p.file.arrayBuffer() : dataUrlToUint8Array(p.thumbDataUrl);
+    await writeFile(photosDir, p.name, bytes);
+  }
+
+  const manifest = buildProjectManifest();
+  await writeFile(projectDir, "project.json", JSON.stringify(manifest));
+
+  state.currentProjectDirHandle = projectDir;
+  state.currentProjectName = projectName;
+  el("projectStatus").textContent = `プロジェクト「${projectName}」を保存しました（PDF・写真・project.json）。`;
+}
+
+// 名前を付けて保存：常に保存先フォルダとプロジェクト名を新しく尋ねる
+async function saveProjectAs() {
   if (!state.pdfDoc) { alert("先にPDFを読み込んでください。"); return; }
   const defaultName = baseNameNoExt(state.pdfName || "project") + "_project";
 
@@ -1552,25 +2049,35 @@ async function saveProject() {
   if (!projectName) return;
 
   try {
-    el("projectStatus").textContent = "保存中...";
     const projectDir = await parentHandle.getDirectoryHandle(projectName, { create: true });
-
-    await writeFile(projectDir, "drawing.pdf", state.pdfBytesForExport);
-
-    const photosDir = await projectDir.getDirectoryHandle("photos", { create: true });
-    for (const p of state.photos) {
-      const bytes = p.file ? await p.file.arrayBuffer() : dataUrlToUint8Array(p.thumbDataUrl);
-      await writeFile(photosDir, p.name, bytes);
-    }
-
-    const manifest = buildProjectManifest();
-    await writeFile(projectDir, "project.json", JSON.stringify(manifest));
-
-    el("projectStatus").textContent = `プロジェクト「${projectName}」を保存しました（PDF・写真・project.json）。`;
+    await writeProjectFiles(projectDir, projectName);
   } catch (err) {
     if (err && err.name === "AbortError") { el("projectStatus").textContent = ""; return; }
     console.error(err);
     alert("プロジェクトの保存に失敗しました: " + err.message);
+  }
+}
+
+// 上書き保存：直前に読込み/保存したフォルダへ、フォルダ選択やプロジェクト名の入力なしでそのまま保存する。
+// まだ読込み/保存していない場合は保存先が無いため「名前を付けて保存」にフォールバックする。
+async function saveProjectOverwrite() {
+  if (!state.pdfDoc) { alert("先にPDFを読み込んでください。"); return; }
+  if (!state.currentProjectDirHandle) {
+    await saveProjectAs();
+    return;
+  }
+  try {
+    if (state.currentProjectDirHandle.requestPermission) {
+      const perm = await state.currentProjectDirHandle.requestPermission({ mode: "readwrite" });
+      if (perm !== "granted") {
+        alert("保存先フォルダへの書き込み権限がありません。「名前を付けて保存」をやり直してください。");
+        return;
+      }
+    }
+    await writeProjectFiles(state.currentProjectDirHandle, state.currentProjectName);
+  } catch (err) {
+    console.error(err);
+    alert("プロジェクトの上書き保存に失敗しました: " + err.message);
   }
 }
 
@@ -1583,12 +2090,26 @@ async function restoreFromManifest(manifest) {
   state.pdfDoc = await loadingTask.promise;
   state.numPages = state.pdfDoc.numPages;
 
+  // pages/pdfSourcesが無い(この機能追加前に保存された)project.jsonでも読み込めるよう、
+  // その場合はゴミ箱・並び替えなしの初期状態として組み立て直す。
+  state.pages = Array.isArray(manifest.pages) && manifest.pages.length
+    ? manifest.pages.map((pg) => ({ srcIndex: pg.srcIndex, trashed: !!pg.trashed }))
+    : Array.from({ length: state.numPages }, (_, i) => ({ srcIndex: i, trashed: false }));
+  state.pdfSources = Array.isArray(manifest.pdfSources) && manifest.pdfSources.length
+    ? manifest.pdfSources
+    : [{ name: state.pdfName, pageCount: state.numPages }];
+  state.dayCompareThreshold = manifest.dayCompareThreshold != null ? manifest.dayCompareThreshold : state.dayCompareThreshold;
+  state.dayCompareRows = Array.isArray(manifest.dayCompareRows) ? manifest.dayCompareRows : [];
+  el("dayCompareThreshold").value = state.dayCompareThreshold;
+
   state.pageView = new Map(Object.entries(manifest.pageView || {}).map(([k, v]) => [Number(k), v]));
   state.pageTransform = new Map(Object.entries(manifest.pageTransform || {}).map(([k, v]) => [Number(k), v]));
 
   state.thumbSize = manifest.thumbSize || state.thumbSize;
   state.pinSize = manifest.pinSize || state.pinSize;
   state.leaderLineWidth = manifest.leaderLineWidth || state.leaderLineWidth;
+  state.leaderLineLength = manifest.leaderLineLength != null ? manifest.leaderLineLength : state.leaderLineLength;
+  state.leaderLineColor = manifest.leaderLineColor || state.leaderLineColor;
   state.arrowWidth = manifest.arrowWidth || state.arrowWidth;
   state.arrowLength = manifest.arrowLength || state.arrowLength;
   state.arrowColor = manifest.arrowColor || state.arrowColor;
@@ -1603,6 +2124,9 @@ async function restoreFromManifest(manifest) {
   el("pinSizeVal").value = state.pinSize;
   el("leaderWidth").value = state.leaderLineWidth;
   el("leaderWidthVal").value = state.leaderLineWidth;
+  el("leaderLength").value = state.leaderLineLength;
+  el("leaderLengthVal").value = state.leaderLineLength;
+  el("leaderColor").value = state.leaderLineColor;
   el("arrowWidth").value = state.arrowWidth;
   el("arrowWidthVal").value = state.arrowWidth;
   el("arrowLength").value = state.arrowLength;
@@ -1617,6 +2141,7 @@ async function restoreFromManifest(manifest) {
     lat: p.lat,
     lon: p.lon,
     hasGps: p.hasGps,
+    capturedAt: p.capturedAt ? new Date(p.capturedAt) : null,
     pageIndex: p.pageIndex,
     baseX: p.baseX,
     baseY: p.baseY,
@@ -1627,6 +2152,8 @@ async function restoreFromManifest(manifest) {
     pinColor: p.pinColor || DEFAULT_PIN_COLOR,
     pinSizeOverride: p.pinSizeOverride != null ? p.pinSizeOverride : null,
     leaderWidthOverride: p.leaderWidthOverride != null ? p.leaderWidthOverride : null,
+    leaderLengthOverride: p.leaderLengthOverride != null ? p.leaderLengthOverride : null,
+    leaderColorOverride: p.leaderColorOverride != null ? p.leaderColorOverride : null,
     arrowWidthOverride: p.arrowWidthOverride != null ? p.arrowWidthOverride : null,
     arrowLengthOverride: p.arrowLengthOverride != null ? p.arrowLengthOverride : null,
     arrowColorOverride: p.arrowColorOverride != null ? p.arrowColorOverride : null,
@@ -1636,49 +2163,60 @@ async function restoreFromManifest(manifest) {
   state.nextPhotoId = manifest.nextPhotoId || (Math.max(0, ...state.photos.map((p) => p.id)) + 1);
   imageCache.clear();
 
-  el("pdfMeta").textContent = `${state.pdfName}\n${state.numPages} ページ`;
+  el("pdfMeta").textContent = state.pdfSources.length > 1
+    ? `${state.pdfSources.map((s) => s.name).join("、")}\n合計 ${state.numPages} ページ（${state.pdfSources.length}個のPDF）`
+    : `${state.pdfName}\n${state.numPages} ページ`;
   el("pageListBlock").hidden = false;
   el("viewerHint").hidden = true;
   el("photoMeta").textContent = `${state.photos.length} 枚（GPSなし: ${state.photos.filter((p) => !p.hasGps).length}枚）`;
 
   buildPageList();
-  await gotoPage(Math.min(manifest.currentPage || 0, state.numPages - 1));
+  updateDayCompareStatus();
+  if (manifest.currentPage === "compare") {
+    gotoComparePage();
+  } else {
+    const visible = visiblePages();
+    const savedPageValid = visible.some((pg) => pg.srcIndex === manifest.currentPage);
+    await gotoPage(savedPageValid ? manifest.currentPage : (visible[0] ? visible[0].srcIndex : 0));
+  }
 }
 
 async function startLoadProject() {
-  if (window.showOpenFilePicker) {
-    // ネイティブのファイル選択ダイアログに、分かりやすい種類名を表示させる。
-    // (単なる <input type=file> だと「カスタム ファイル」としか出せない)
+  if (window.showDirectoryPicker) {
+    // プロジェクトの「フォルダ」自体を選んでもらう(project.jsonファイル単体ではなく)。
+    // こうしてフォルダのハンドルを保持しておくことで、後から「保存(上書)」で
+    // フォルダ選択やファイル名の入力なしに同じ場所へ書き戻せるようにする。
     try {
       const lastDir = await idbGet(IDB_KEY_LAST_DIR);
-      const opts = {
-        id: "photoPdfProjectLoad",
-        types: [{
-          description: "写真PDF配置ツール プロジェクトファイル",
-          accept: { "application/json": [".json"] },
-        }],
-      };
-      if (lastDir) opts.startIn = lastDir;
-      const [handle] = await window.showOpenFilePicker(opts);
-      idbSet(IDB_KEY_LAST_DIR, handle);
-      const file = await handle.getFile();
-      onProjectFileSelected(file);
+      const projectDir = await window.showDirectoryPicker(lastDir ? { mode: "readwrite", startIn: lastDir } : { mode: "readwrite" });
+      idbSet(IDB_KEY_LAST_DIR, projectDir);
+      let fileHandle;
+      try {
+        fileHandle = await projectDir.getFileHandle("project.json");
+      } catch (err) {
+        alert("選択したフォルダに project.json が見つかりませんでした。プロジェクトのフォルダを選択してください。");
+        return;
+      }
+      const file = await fileHandle.getFile();
+      await onProjectFileSelected(file, projectDir);
     } catch (err) {
       if (err && err.name === "AbortError") return;
       console.error(err);
-      alert("プロジェクトファイルの選択に失敗しました: " + err.message);
+      alert("プロジェクトの読み込みに失敗しました: " + err.message);
     }
     return;
   }
   el("projectInput").click();
 }
 
-async function onProjectFileSelected(file) {
+async function onProjectFileSelected(file, projectDir) {
   try {
     el("projectStatus").textContent = "プロジェクトを読み込み中...";
     const text = await file.text();
     const manifest = JSON.parse(text);
     await restoreFromManifest(manifest);
+    state.currentProjectDirHandle = projectDir || null;
+    state.currentProjectName = projectDir ? projectDir.name : null;
     el("projectStatus").textContent = `プロジェクトを読み込みました（${state.pdfName}）。`;
   } catch (err) {
     console.error(err);
@@ -1697,7 +2235,8 @@ async function exportCompositePdf() {
     const font = await outDoc.embedFont(StandardFonts.HelveticaBold);
 
     const activePhotos = getActivePhotos();
-    for (let pageIndex = 0; pageIndex < state.numPages; pageIndex++) {
+    for (const pg of visiblePages()) {
+      const pageIndex = pg.srcIndex;
       const photosOnPage = getPagePhotos(pageIndex);
       if (!photosOnPage.length) continue;
 
@@ -1728,17 +2267,19 @@ async function exportCompositePdf() {
         const pinSizePx = effPinSize(pin.photo);
         const r = pinSizePx / viewport.scale;
         const screenX = pin.pos.x, screenY = pin.pos.y;
-        const thumbCx = screenX + pinSizePx + state.thumbSize / 2 + 4;
-        const thumbCy = screenY - pinSizePx - state.thumbSize / 2 - 4;
+        const leaderLen = effLeaderLength(pin.photo);
+        const thumbCx = screenX + pinSizePx + state.thumbSize / 2 + leaderLen;
+        const thumbCy = screenY - pinSizePx - state.thumbSize / 2 - leaderLen;
 
         const center = pdfPoint(screenX, screenY);
         const leaderEnd = pdfPoint(thumbCx - state.thumbSize * 0.15, thumbCy + state.thumbSize * 0.15);
         const rect = pdfRect(thumbCx - state.thumbSize / 2, thumbCy - state.thumbSize / 2, thumbCx + state.thumbSize / 2, thumbCy + state.thumbSize / 2);
 
         // 引き出し線
+        const [lcR, lcG, lcB] = hexToRgbTriple(effLeaderColor(pin.photo));
         page.drawLine({
           start: center, end: leaderEnd,
-          thickness: effLeaderWidth(pin.photo), color: rgb(0.15, 0.39, 0.92), dashArray: [3, 2],
+          thickness: effLeaderWidth(pin.photo), color: rgb(lcR, lcG, lcB),
         });
 
         // サムネイル画像（フチ付き）
@@ -1750,13 +2291,14 @@ async function exportCompositePdf() {
           x: rect.x, y: rect.y, width: rect.width, height: rect.height,
           color: rgb(1, 1, 1), borderColor: rgb(bR, bG, bB), borderWidth: borderWpx,
         });
-        const inset = Math.max(2, borderWpx) / viewport.scale;
+        const inset = (borderWpx / 2) / viewport.scale;
         page.drawImage(embedded, {
           x: rect.x + inset, y: rect.y + inset, width: rect.width - inset * 2, height: rect.height - inset * 2,
         });
 
         // 撮影方向の矢印
-        const arrow = arrowGeometry(screenX, screenY, pin.dir, effArrowLength(pin.photo));
+        const pinArrowLen = effArrowLength(pin.photo);
+        const arrow = arrowGeometry(screenX, screenY, pin.dir, pinArrowLen, arrowHeadLength(effArrowWidth(pin.photo), pinArrowLen));
         const aBase = pdfPoint(arrow.base.x, arrow.base.y);
         const aTip = pdfPoint(arrow.tip.x, arrow.tip.y);
         const aWing1 = pdfPoint(arrow.wing1.x, arrow.wing1.y);
@@ -1782,6 +2324,10 @@ async function exportCompositePdf() {
         });
       }
     }
+
+    // ゴミ箱に入れたページは出力しない。indexがずれないよう大きい番号から削除する。
+    const trashedSrcIndices = state.pages.filter((pg) => pg.trashed).map((pg) => pg.srcIndex).sort((a, b) => b - a);
+    for (const idx of trashedSrcIndices) outDoc.removePage(idx);
 
     const bytes = await outDoc.save();
     downloadBlob(new Blob([bytes], { type: "application/pdf" }), baseNameNoExt(state.pdfName) + "_写真配置.pdf");
@@ -1818,7 +2364,8 @@ async function exportExcel() {
     // シート1: PDF図面（ページ画像）
     const sheetPdf = wb.addWorksheet("PDF図面");
     let rowCursor = 1;
-    for (let pageIndex = 0; pageIndex < state.numPages; pageIndex++) {
+    for (const [i, pg] of visiblePages().entries()) {
+      const pageIndex = pg.srcIndex;
       const page = await state.pdfDoc.getPage(pageIndex + 1);
       const viewport = page.getViewport({ scale: 1.5 });
       const c = document.createElement("canvas");
@@ -1827,7 +2374,7 @@ async function exportExcel() {
       const dataUrl = c.toDataURL("image/png");
       const imgId = wb.addImage({ base64: dataUrl, extension: "png" });
 
-      sheetPdf.getCell(rowCursor, 1).value = `ページ ${pageIndex + 1}`;
+      sheetPdf.getCell(rowCursor, 1).value = `ページ ${i + 1}`;
       const wPx = viewport.width, hPx = viewport.height;
       const maxW = 900;
       const dispW = Math.min(maxW, wPx), dispH = hPx * (dispW / wPx);
@@ -1852,7 +2399,7 @@ async function exportExcel() {
       const r = sheetPhotos.addRow({
         no: p.numberLabel != null ? p.numberLabel : idx + 1,
         name: p.name,
-        page: p.hasGps ? p.pageIndex + 1 : "-",
+        page: p.hasGps ? (displayPageNumber(p.pageIndex) || "(ページはゴミ箱内)") : "-",
         lat: p.hasGps ? p.lat : "",
         lon: p.hasGps ? p.lon : "",
         gps: p.hasGps ? "あり" : "なし",
@@ -1872,7 +2419,8 @@ async function exportExcel() {
       { header: "図面上Y(px)", key: "y", width: 12 },
       { header: "撮影方向(度・上=0/時計回り)", key: "dir", width: 22 },
     ];
-    for (let pageIndex = 0; pageIndex < state.numPages; pageIndex++) {
+    for (const [i, pg] of visiblePages().entries()) {
+      const pageIndex = pg.srcIndex;
       const photosOnPage = getPagePhotos(pageIndex);
       if (!photosOnPage.length) continue;
       const t = getPageTransform(pageIndex);
@@ -1881,7 +2429,7 @@ async function exportExcel() {
         const dir = normalizeAngle(p.directionDeg + t.rotationDeg);
         sheetPins.addRow({
           no: p.numberLabel != null ? p.numberLabel : activePhotos.indexOf(p) + 1,
-          name: p.name, page: pageIndex + 1,
+          name: p.name, page: i + 1,
           x: Math.round(pos.x), y: Math.round(pos.y), dir: Math.round(dir),
         });
       });
@@ -1907,7 +2455,8 @@ async function exportExcel() {
       sheet.addImage(id, { tl: absAnchor(x, y), ext: { width: w, height: h } });
     };
 
-    for (let pageIndex = 0; pageIndex < state.numPages; pageIndex++) {
+    for (const [i, pg] of visiblePages().entries()) {
+      const pageIndex = pg.srcIndex;
       const photosOnPage = getPagePhotos(pageIndex);
       if (!photosOnPage.length) continue;
 
@@ -1915,7 +2464,7 @@ async function exportExcel() {
       const srcPage = await state.pdfDoc.getPage(pageIndex + 1);
       const viewport = srcPage.getViewport({ scale: view.zoom / 100 });
 
-      const sheet = wb.addWorksheet(`ページ${pageIndex + 1}配置`);
+      const sheet = wb.addWorksheet(`ページ${i + 1}配置`);
       // 画像は絶対座標(nativeColOff/nativeRowOff)で配置するため列幅・行高自体は
       // 位置計算に使われないが、余裕を持って広げておきExcel側の警告を避ける。
       sheet.getColumn(1).width = Math.ceil((viewport.width + 400) / 6);
@@ -1939,12 +2488,14 @@ async function exportExcel() {
       for (const pin of pins) {
         const r = effPinSize(pin.photo);
         const thumb = state.thumbSize;
-        const thumbCx = pin.pos.x + r + thumb / 2 + 4;
-        const thumbCy = pin.pos.y - r - thumb / 2 - 4;
+        const leaderLen = effLeaderLength(pin.photo);
+        const thumbCx = pin.pos.x + r + thumb / 2 + leaderLen;
+        const thumbCy = pin.pos.y - r - thumb / 2 - leaderLen;
 
         // 撮影方向の矢印
         {
-          const arrow = arrowGeometry(pin.pos.x, pin.pos.y, pin.dir, effArrowLength(pin.photo));
+          const xlArrowLen = effArrowLength(pin.photo);
+          const arrow = arrowGeometry(pin.pos.x, pin.pos.y, pin.dir, xlArrowLen, arrowHeadLength(effArrowWidth(pin.photo), xlArrowLen));
           const w0 = effArrowWidth(pin.photo);
           const pts = [arrow.base, arrow.tip, arrow.wing1, arrow.wing2];
           const pad = Math.ceil(w0) + 3;
@@ -1968,13 +2519,13 @@ async function exportExcel() {
           const lw = effLeaderWidth(pin.photo);
           const x1 = pin.pos.x, y1 = pin.pos.y;
           const x2 = thumbCx - thumb / 2 * 0.3, y2 = thumbCy + thumb / 2 * 0.3;
+          const lc = effLeaderColor(pin.photo);
           const pad = Math.ceil(lw) + 2;
           const minX = Math.min(x1, x2) - pad, minY = Math.min(y1, y2) - pad;
           const w = Math.abs(x2 - x1) + pad * 2, h = Math.abs(y2 - y1) + pad * 2;
           const dataUrl = miniPng(w, h, (ctx) => {
-            ctx.strokeStyle = "rgba(37,99,235,0.75)";
+            ctx.strokeStyle = lc;
             ctx.lineWidth = lw;
-            ctx.setLineDash([3, 2]);
             ctx.beginPath();
             ctx.moveTo(x1 - minX, y1 - minY);
             ctx.lineTo(x2 - minX, y2 - minY);
@@ -2001,7 +2552,7 @@ async function exportExcel() {
 
         // サムネイル写真本体
         {
-          const inset = Math.max(2, effThumbBorderWidth(pin.photo));
+          const inset = effThumbBorderWidth(pin.photo) / 2;
           const imgId = wb.addImage({ base64: pin.photo.thumbDataUrl, extension: "jpeg" });
           sheet.addImage(imgId, {
             tl: absAnchor(thumbCx - thumb / 2 + inset, thumbCy - thumb / 2 + inset),
