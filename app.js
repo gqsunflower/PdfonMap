@@ -966,6 +966,86 @@ function updateDayCompareStatus() {
     `マッチ済み：${matched}件 / 新規番号：${day2Photos.length - matched}枚`;
 }
 
+// 日付比較の行データ(1日目写真ごとの候補一覧＋マッチしなかった新規分)を
+// PDF/Excel出力・プレビューの3箇所で共通して使う形にまとめる
+function buildCompareLayoutRows() {
+  const { day1Key, day2Keys, day1Photos, day2Photos } = dayGroups();
+  const sortedDay1 = [...day1Photos].sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
+  const matchedIds = new Set();
+  const rows = sortedDay1.map((d1) => {
+    const stored = state.dayCompareRows.find((r) => r.day1Id === d1.id) || { candidateIds: [] };
+    const candidates = stored.candidateIds
+      .map((id) => state.photos.find((p) => p.id === id))
+      .filter(Boolean);
+    candidates.forEach((p) => matchedIds.add(p.id));
+    return { day1: d1, day1Label: labelOfPhoto(d1), candidates };
+  });
+  const newOnes = day2Photos
+    .filter((p) => !matchedIds.has(p.id))
+    .sort((a, b) => compareLabels(labelOfPhoto(a), labelOfPhoto(b)));
+  return { day1Key, day2Keys, rows, newOnes };
+}
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+// 1枚の写真を「サムネイル＋丸番号バッジ＋ファイル名」の1枚のカード画像(PNG)にまとめる。
+// PDF出力・Excel出力の両方で、このカード単位の画像をそのまま配置する。
+async function buildCompareCardImage(photo, label, w, h) {
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#fafbfc";
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = "#d7dce3";
+  ctx.strokeRect(0.5, 0.5, w - 1, h - 1);
+
+  const pad = 6, nameH = 16;
+  const areaW = w - pad * 2, areaH = h - nameH - pad * 2;
+  try {
+    const img = await loadImage(photo.thumbDataUrl);
+    const scale = Math.max(areaW / img.width, areaH / img.height);
+    const dw = img.width * scale, dh = img.height * scale;
+    const dx = pad + (areaW - dw) / 2, dy = pad + (areaH - dh) / 2;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(pad, pad, areaW, areaH);
+    ctx.clip();
+    ctx.drawImage(img, dx, dy, dw, dh);
+    ctx.restore();
+  } catch (e) { /* サムネイルが読めなくても枠だけは出す */ }
+
+  const color = photo.pinColor || DEFAULT_PIN_COLOR;
+  const r = 12;
+  ctx.beginPath();
+  ctx.arc(pad + r, pad + r, r, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#fff";
+  ctx.stroke();
+  ctx.fillStyle = contrastTextColor(color);
+  ctx.font = "bold 13px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(String(label), pad + r, pad + r + 1);
+
+  ctx.fillStyle = "#333";
+  ctx.font = "11px sans-serif";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "alphabetic";
+  let name = photo.name;
+  while (name.length > 4 && ctx.measureText(name).width > w - 8) name = name.slice(0, -1);
+  if (name !== photo.name) name = name.replace(/\.[^.]*$/, "").slice(0, Math.max(1, name.length - 1)) + "…";
+  ctx.fillText(name, w / 2, h - 6);
+
+  return c.toDataURL("image/png");
+}
+
 // ---------- 写真一覧UI ----------
 function renderPhotoList() {
   const box = el("photoList");
@@ -2329,12 +2409,102 @@ async function exportCompositePdf() {
     const trashedSrcIndices = state.pages.filter((pg) => pg.trashed).map((pg) => pg.srcIndex).sort((a, b) => b - a);
     for (const idx of trashedSrcIndices) outDoc.removePage(idx);
 
+    // 末尾に日付比較ページを追加(1日目の写真が無ければ何もしない)
+    const compareLayout = buildCompareLayoutRows();
+    if (compareLayout.day1Key) await appendDayComparePagesToPdf(outDoc, compareLayout);
+
     const bytes = await outDoc.save();
     downloadBlob(new Blob([bytes], { type: "application/pdf" }), baseNameNoExt(state.pdfName) + "_写真配置.pdf");
     el("exportStatus").textContent = "PDF出力が完了しました。";
   } catch (err) {
     console.error(err);
     el("exportStatus").textContent = "PDF出力に失敗しました: " + err.message;
+  }
+}
+// pdf-lib標準フォント(Helvetica系)は日本語を含められないため、日本語ラベルは
+// キャンバスで描画してPNG画像として埋め込む(数字だけのピン番号はbuildCompareCardImage側で
+// 同様にラスタライズ済みなので、ここでは見出し等の日本語文言のみを対象にする)。
+async function embedTextImage(outDoc, text, px, color) {
+  const measureCanvas = document.createElement("canvas");
+  const fontSpec = `${px}px sans-serif`;
+  const mctx = measureCanvas.getContext("2d");
+  mctx.font = fontSpec;
+  const w = Math.ceil(mctx.measureText(text).width) + 6;
+  const h = Math.ceil(px * 1.5);
+  measureCanvas.width = w; measureCanvas.height = h;
+  const ctx = measureCanvas.getContext("2d");
+  ctx.font = fontSpec;
+  ctx.fillStyle = color;
+  ctx.textBaseline = "top";
+  ctx.fillText(text, 3, 2);
+  const png = await outDoc.embedPng(measureCanvas.toDataURL("image/png"));
+  return { png, width: w, height: h };
+}
+
+// 日付比較の内容(1日目=左、候補=右)を、必要なだけ新しいページに追記する。
+// カードは1枚ずつPNG化して貼り付けるだけなので、既存ページの図面には一切影響しない。
+async function appendDayComparePagesToPdf(outDoc, layout) {
+  const pageW = 842, pageH = 595; // A4横向き相当。1pt=1pxとして扱う簡易ページ
+  const margin = 24, cardW = 110, cardH = 100, gap = 8;
+  const leftColW = cardW + 20;
+  const cardsPerRow = Math.max(1, Math.floor((pageW - margin * 2 - leftColW + gap) / (cardW + gap)));
+
+  let page = outDoc.addPage([pageW, pageH]);
+  let y = pageH - margin;
+  const titleImg = await embedTextImage(
+    outDoc, `日付比較（1日目:${layout.day1Key} / 2日目以降:${layout.day2Keys.join("、") || "-"}）`, 16, "#1a1a1a");
+  page.drawImage(titleImg.png, { x: margin, y: y - titleImg.height, width: titleImg.width, height: titleImg.height });
+  y -= titleImg.height + 16;
+
+  const ensureSpace = (neededH) => {
+    if (y - neededH < margin) {
+      page = outDoc.addPage([pageW, pageH]);
+      y = pageH - margin;
+    }
+  };
+  const placeCard = async (dataUrl, x, topY) => {
+    const png = await outDoc.embedPng(dataUrl);
+    page.drawImage(png, { x, y: topY - cardH, width: cardW, height: cardH });
+  };
+
+  const noCandidateImg = await embedTextImage(outDoc, "候補なし", 12, "#666666");
+  for (const row of layout.rows) {
+    const lines = Math.max(1, Math.ceil(row.candidates.length / cardsPerRow));
+    const rowH = lines * (cardH + gap) - gap;
+    ensureSpace(rowH);
+
+    const topY = y;
+    await placeCard(await buildCompareCardImage(row.day1, row.day1Label, cardW, cardH), margin, topY);
+    if (!row.candidates.length) {
+      page.drawImage(noCandidateImg.png, {
+        x: margin + leftColW, y: topY - cardH / 2 - noCandidateImg.height / 2,
+        width: noCandidateImg.width, height: noCandidateImg.height,
+      });
+    } else {
+      for (let i = 0; i < row.candidates.length; i++) {
+        const col = i % cardsPerRow, line = Math.floor(i / cardsPerRow);
+        const cx = margin + leftColW + col * (cardW + gap);
+        const cy = topY - line * (cardH + gap);
+        const c2 = row.candidates[i];
+        await placeCard(await buildCompareCardImage(c2, c2.numberLabel, cardW, cardH), cx, cy);
+      }
+    }
+    y = topY - rowH - gap;
+  }
+
+  if (layout.newOnes.length) {
+    ensureSpace(30);
+    const newTitleImg = await embedTextImage(outDoc, "新規番号（1日目に該当地点なし）", 13, "#1a1a1a");
+    page.drawImage(newTitleImg.png, { x: margin, y: y - newTitleImg.height, width: newTitleImg.width, height: newTitleImg.height });
+    y -= newTitleImg.height + 12;
+    const newPerRow = Math.max(1, Math.floor((pageW - margin * 2 + gap) / (cardW + gap)));
+    for (let i = 0; i < layout.newOnes.length; i++) {
+      const col = i % newPerRow;
+      if (col === 0) ensureSpace(cardH + gap);
+      const cx = margin + col * (cardW + gap);
+      await placeCard(await buildCompareCardImage(layout.newOnes[i], labelOfPhoto(layout.newOnes[i]), cardW, cardH), cx, y);
+      if (col === newPerRow - 1) y -= cardH + gap;
+    }
   }
 }
 function dataUrlToUint8Array(dataUrl) {
@@ -2579,6 +2749,44 @@ async function exportExcel() {
           addPng(sheet, dataUrl, pin.pos.x - size / 2, pin.pos.y - size / 2, size, size);
         }
       }
+    }
+
+    // シート: 日付比較(1日目=左、2日目候補=右)。1日目の写真が無ければ追加しない。
+    const compareLayout = buildCompareLayoutRows();
+    if (compareLayout.day1Key) {
+      const sheet = wb.addWorksheet("日付比較");
+      sheet.getCell(1, 1).value =
+        `1日目：${compareLayout.day1Key}　/　2日目以降：${compareLayout.day2Keys.join("、") || "-"}`;
+
+      const cardW = 110, cardH = 100, gap = 10;
+      const leftX = 10, rightX0 = leftX + cardW + 30;
+      let maxCandidates = 0;
+      let y = 40;
+      for (const row of compareLayout.rows) {
+        maxCandidates = Math.max(maxCandidates, row.candidates.length);
+        addPng(sheet, await buildCompareCardImage(row.day1, row.day1Label, cardW, cardH), leftX, y, cardW, cardH);
+        for (let i = 0; i < row.candidates.length; i++) {
+          const c2 = row.candidates[i];
+          addPng(sheet, await buildCompareCardImage(c2, c2.numberLabel, cardW, cardH),
+            rightX0 + i * (cardW + gap), y, cardW, cardH);
+        }
+        y += cardH + gap;
+      }
+      let maxRowWidth = rightX0 + maxCandidates * (cardW + gap);
+      if (compareLayout.newOnes.length) {
+        sheet.getCell(Math.round(y / 18) + 1, 1).value = "新規番号（1日目に該当地点なし）";
+        y += 26;
+        let x = leftX;
+        for (const p of compareLayout.newOnes) {
+          addPng(sheet, await buildCompareCardImage(p, labelOfPhoto(p), cardW, cardH), x, y, cardW, cardH);
+          x += cardW + gap;
+        }
+        maxRowWidth = Math.max(maxRowWidth, x);
+        y += cardH + gap;
+      }
+      // 画像は絶対座標配置のため列幅・行高自体は位置計算に使わないが、余裕を持って広げておく
+      sheet.getColumn(1).width = Math.ceil((maxRowWidth + 400) / 6);
+      sheet.getRow(1).height = (y + 400) * 0.75;
     }
 
     const buf = await wb.xlsx.writeBuffer();
