@@ -313,10 +313,10 @@ label input[type=range] { vertical-align: middle; }
 
 #pageListBlock, #trashBlock { margin-top: 12px; }
 
-/* 日付比較ページ */
+/* 日付比較ページ(列=回、行=地点のグリッド表示。列数は撮影回の数だけ動的に増える) */
 .compareView {
   flex: 1;
-  overflow-y: auto;
+  overflow: auto;
   padding: 20px;
   display: flex;
   flex-direction: column;
@@ -324,14 +324,14 @@ label input[type=range] { vertical-align: middle; }
   background: #fff;
 }
 .compareRow {
-  display: flex;
-  gap: 16px;
+  display: grid;
+  gap: 10px;
   border-bottom: 1px solid var(--border);
   padding-bottom: 14px;
 }
-.compareCell { display: flex; }
-.compareLeft { flex: 0 0 140px; }
-.compareRight { flex: 1; flex-wrap: wrap; gap: 10px; }
+.compareHeaderRow { border-bottom: 2px solid var(--border); padding-bottom: 6px; }
+.compareHeaderCell { font-weight: 700; color: var(--muted); font-size: 12.5px; }
+.compareCell { display: flex; flex-wrap: wrap; align-content: flex-start; gap: 10px; }
 .comparePhotoCard {
   position: relative;
   width: 130px;
@@ -370,6 +370,3 @@ label input[type=range] { vertical-align: middle; }
   border-color: #dc2626;
   background: #fff;
 }
-.compareNewSection { border-top: 2px dashed var(--border); padding-top: 10px; }
-.compareNewSection h4 { margin: 0 0 8px; font-size: 13px; color: var(--muted); }
-.compareNewWrap { display: flex; flex-wrap: wrap; gap: 10px; }
