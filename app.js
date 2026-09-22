@@ -56,6 +56,7 @@ const state = {
   layerPanMode: false,
   draggingPin: null,   // photo id being dragged
   draggingArrow: null, // photo id whose direction arrow is being dragged
+  draggingThumb: null, // photo id whose thumbnail(だけ)を移動中
   draggingLayer: false,
   dragLast: null,
 
@@ -788,13 +789,14 @@ async function addPhoto(file) {
     if (capturedAt && isNaN(capturedAt.getTime())) capturedAt = null;
   } catch (e) { capturedAt = null; }
 
-  const thumbDataUrl = await makeThumbnail(file, 320);
+  const { dataUrl: thumbDataUrl, aspectRatio } = await makeThumbnail(file, 320);
 
   const photo = {
     id: state.nextPhotoId++,
     file,
     name: file.name,
     thumbDataUrl,
+    aspectRatio, // 元写真の横÷縦。サムネイル枠を元の縦横比のまま表示するために使う
     lat: gps ? gps.latitude : null,
     lon: gps ? gps.longitude : null,
     hasGps: !!gps,
@@ -803,7 +805,8 @@ async function addPhoto(file) {
       ? state.currentPage
       : (visiblePages()[0] ? visiblePages()[0].srcIndex : 0),
     baseX: 0, baseY: 0,
-    manualOffset: null,  // {x,y}|null。baseX/baseYと同じ基準座標系での手動位置調整分
+    manualOffset: null,  // {x,y}|null。baseX/baseYと同じ基準座標系での手動位置調整分(ピン自体の位置)
+    thumbOffset: null,   // {x,y}|null。画面ピクセル単位でのサムネイル位置の手動微調整分(ピンからは独立。重なり回避用)
     numberLabel: null,   // null = 自動採番（一覧順）。手動変更するとその文字列を表示
     directionDeg: 0,     // 撮影方向（レイヤー回転0のときの上方向を0とする、時計回り）
     trashed: false,      // true の間はゴミ箱に入っており、ピン等には表示されない
@@ -828,13 +831,14 @@ function makeThumbnail(file, maxSize) {
     const url = URL.createObjectURL(file);
     img.onload = () => {
       let w = img.naturalWidth, h = img.naturalHeight;
+      const aspectRatio = w / h;
       const ratio = Math.min(1, maxSize / Math.max(w, h));
       w = Math.round(w * ratio); h = Math.round(h * ratio);
       const c = document.createElement("canvas");
       c.width = w; c.height = h;
       c.getContext("2d").drawImage(img, 0, 0, w, h);
       URL.revokeObjectURL(url);
-      resolve(c.toDataURL("image/jpeg", 0.85));
+      resolve({ dataUrl: c.toDataURL("image/jpeg", 0.85), aspectRatio });
     };
     img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("image load failed")); };
     img.src = url;
@@ -1343,6 +1347,21 @@ function effArrowColor(p) { return p.arrowColorOverride != null ? p.arrowColorOv
 function effThumbBorderWidth(p) { return p.thumbBorderWidthOverride != null ? p.thumbBorderWidthOverride : state.thumbBorderWidth; }
 function effThumbBorderColor(p) { return p.thumbBorderColorOverride != null ? p.thumbBorderColorOverride : state.thumbBorderColor; }
 
+// サムネイル枠のサイズ(px)。state.thumbSize(スライダー)を長辺の目安とし、
+// 元写真の縦横比(photo.aspectRatio)を保ったまま短辺を縮める(引き伸ばし・切り抜きをしない)。
+function thumbBoxSize(photo, sizePx) {
+  const base = sizePx != null ? sizePx : state.thumbSize;
+  const ar = photo.aspectRatio || 1;
+  return ar >= 1 ? { w: base, h: base / ar } : { w: base * ar, h: base };
+}
+// サムネイルの中心位置。ピンから右上へ(pinサイズ+サムネ半分+引き出し線長さ)ぶん離れた位置が既定で、
+// そこにさらに写真ごとの手動調整分(thumbOffset、画面ピクセル単位)を加える。
+// 重なりやすい「同一地点で撮った複数枚」を、ピンとは別に写真だけ動かして避けられるようにするためのもの。
+function thumbCenter(pos, r, thumbW, thumbH, leaderLen, thumbOffset) {
+  const ox = thumbOffset ? thumbOffset.x : 0, oy = thumbOffset ? thumbOffset.y : 0;
+  return { x: pos.x + r + thumbW / 2 + leaderLen + ox, y: pos.y - r - thumbH / 2 - leaderLen + oy };
+}
+
 // cx,cy: ピン中心。angleDeg: 上(画面のY-)を0とし時計回りの角度。
 // headLen: 矢じり(先端の三角)の長さ。省略時は既定値(ARROW_HEAD_LEN)を使う。
 function arrowGeometry(cx, cy, angleDeg, length, headLen) {
@@ -1449,10 +1468,9 @@ function drawLayerBoundsOverlay(ctx, photosOnPage, t, canvas, viewRotation) {
 function drawPin(ctx, pin) {
   const { pos, photo, index, dir } = pin;
   const r = effPinSize(photo);
-  const thumb = state.thumbSize;
+  const { w: thumbW, h: thumbH } = thumbBoxSize(photo);
   const leaderLen = effLeaderLength(photo);
-  const thumbCx = pos.x + r + thumb / 2 + leaderLen;
-  const thumbCy = pos.y - r - thumb / 2 - leaderLen;
+  const { x: thumbCx, y: thumbCy } = thumbCenter(pos, r, thumbW, thumbH, leaderLen, photo.thumbOffset);
 
   // 撮影方向の矢印
   const arrowCol = effArrowColor(photo);
@@ -1480,11 +1498,11 @@ function drawPin(ctx, pin) {
   ctx.lineWidth = effLeaderWidth(photo);
   ctx.beginPath();
   ctx.moveTo(pos.x, pos.y);
-  ctx.lineTo(thumbCx - thumb / 2 * 0.3, thumbCy + thumb / 2 * 0.3);
+  ctx.lineTo(thumbCx - thumbW / 2 * 0.3, thumbCy + thumbH / 2 * 0.3);
   ctx.stroke();
   ctx.restore();
 
-  // サムネイル（フチ付き）
+  // サムネイル（フチ付き。元写真の縦横比のまま表示する）
   const img = pin.photo._imgEl || getCachedImage(photo);
   const borderW = effThumbBorderWidth(photo);
   const inset = borderW / 2;
@@ -1492,11 +1510,11 @@ function drawPin(ctx, pin) {
   ctx.fillStyle = "#fff";
   ctx.strokeStyle = effThumbBorderColor(photo);
   ctx.lineWidth = borderW;
-  ctx.fillRect(thumbCx - thumb / 2, thumbCy - thumb / 2, thumb, thumb);
+  ctx.fillRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbW, thumbH);
   if (img && img.complete) {
-    ctx.drawImage(img, thumbCx - thumb / 2 + inset, thumbCy - thumb / 2 + inset, thumb - inset * 2, thumb - inset * 2);
+    ctx.drawImage(img, thumbCx - thumbW / 2 + inset, thumbCy - thumbH / 2 + inset, thumbW - inset * 2, thumbH - inset * 2);
   }
-  ctx.strokeRect(thumbCx - thumb / 2, thumbCy - thumb / 2, thumb, thumb);
+  ctx.strokeRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbW, thumbH);
   ctx.restore();
 
   // ピン（円+番号）
@@ -1595,6 +1613,14 @@ function onCanvasMouseDown(e) {
     state.dragLast = pos;
     return;
   }
+  // 同じ地点で撮った写真同士でサムネイルが重なる場合に、ピンとは別に
+  // 写真だけをつまんでずらせるようにする(ピン自体の位置には影響しない)。
+  const thumbHit = hitTestThumbnail(pos);
+  if (thumbHit) {
+    state.draggingThumb = thumbHit.id;
+    state.dragLast = pos;
+    return;
+  }
   // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
   // それ以外でも写真レイヤーの枠(基準線)を直接つまんでドラッグすれば移動できるようにする。
   if (state.layerPanMode || hitTestLayerBounds(pos)) {
@@ -1638,17 +1664,16 @@ function hitTestPin(pos) {
 // サムネイル画像からも開けるようにするため)
 function hitTestThumbnail(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
-  const thumb = state.thumbSize;
   for (let i = photosOnPage.length - 1; i >= 0; i--) {
     const p = photosOnPage[i];
     const sp = p._screenPos;
     if (!sp) continue;
     const r = effPinSize(p);
+    const { w: thumbW, h: thumbH } = thumbBoxSize(p);
     const leaderLen = effLeaderLength(p);
-    const thumbCx = sp.x + r + thumb / 2 + leaderLen;
-    const thumbCy = sp.y - r - thumb / 2 - leaderLen;
-    if (pos.x >= thumbCx - thumb / 2 && pos.x <= thumbCx + thumb / 2
-      && pos.y >= thumbCy - thumb / 2 && pos.y <= thumbCy + thumb / 2) {
+    const { x: thumbCx, y: thumbCy } = thumbCenter(sp, r, thumbW, thumbH, leaderLen, p.thumbOffset);
+    if (pos.x >= thumbCx - thumbW / 2 && pos.x <= thumbCx + thumbW / 2
+      && pos.y >= thumbCy - thumbH / 2 && pos.y <= thumbCy + thumbH / 2) {
       return p;
     }
   }
@@ -1667,7 +1692,7 @@ function hitTestArrowTip(pos) {
   return null;
 }
 function onCanvasMouseMove(e) {
-  if (!state.draggingPin && !state.draggingLayer && !state.draggingArrow) return;
+  if (!state.draggingPin && !state.draggingLayer && !state.draggingArrow && !state.draggingThumb) return;
   const pos = canvasPosFromEvent(e);
   if (state.draggingArrow) {
     const photo = state.photos.find((p) => p.id === state.draggingArrow);
@@ -1694,6 +1719,13 @@ function onCanvasMouseMove(e) {
     const prev = photo.manualOffset || { x: 0, y: 0 };
     photo.manualOffset = { x: prev.x + baseDx, y: prev.y + baseDy };
     renderPins();
+  } else if (state.draggingThumb) {
+    const photo = state.photos.find((p) => p.id === state.draggingThumb);
+    // サムネイルは画面ピクセル単位の固定オフセットで配置しているため(ピンサイズ・
+    // サムネサイズと同様にPDFの拡大率に対して不変)、ドラッグ量もそのまま加算する。
+    const prev = photo.thumbOffset || { x: 0, y: 0 };
+    photo.thumbOffset = { x: prev.x + dx, y: prev.y + dy };
+    renderPins();
   } else if (state.draggingLayer) {
     const t = getPageTransform(state.currentPage);
     t.offsetX += dx; t.offsetY += dy;
@@ -1703,6 +1735,7 @@ function onCanvasMouseMove(e) {
 function onCanvasMouseUp() {
   state.draggingPin = null;
   state.draggingArrow = null;
+  state.draggingThumb = null;
   state.draggingLayer = false;
   state.dragLast = null;
 }
@@ -2073,6 +2106,7 @@ function buildProjectManifest() {
       id: p.id,
       name: p.name,
       thumbDataUrl: p.thumbDataUrl,
+      aspectRatio: p.aspectRatio,
       lat: p.lat,
       lon: p.lon,
       hasGps: p.hasGps,
@@ -2081,6 +2115,7 @@ function buildProjectManifest() {
       baseX: p.baseX,
       baseY: p.baseY,
       manualOffset: p.manualOffset,
+      thumbOffset: p.thumbOffset,
       numberLabel: p.numberLabel,
       directionDeg: p.directionDeg,
       trashed: p.trashed,
@@ -2250,6 +2285,7 @@ async function restoreFromManifest(manifest) {
     file: dataUrlToFile(p.thumbDataUrl, p.name),
     name: p.name,
     thumbDataUrl: p.thumbDataUrl,
+    aspectRatio: p.aspectRatio || 1, // この機能追加前に保存されたproject.jsonは無いため正方形扱いにフォールバック
     lat: p.lat,
     lon: p.lon,
     hasGps: p.hasGps,
@@ -2258,6 +2294,7 @@ async function restoreFromManifest(manifest) {
     baseX: p.baseX,
     baseY: p.baseY,
     manualOffset: p.manualOffset || null,
+    thumbOffset: p.thumbOffset || null,
     numberLabel: p.numberLabel,
     directionDeg: p.directionDeg || 0,
     trashed: !!p.trashed,
@@ -2365,8 +2402,6 @@ async function exportCompositePdf() {
         const xs = c.map((p) => p.x), ys = c.map((p) => p.y);
         return { x: Math.min(...xs), y: Math.min(...ys), width: Math.max(...xs) - Math.min(...xs), height: Math.max(...ys) - Math.min(...ys) };
       };
-      const thumb = state.thumbSize / viewport.scale;
-
       const t = getPageTransform(pageIndex);
       const pins = photosOnPage.map((p) => ({
         photo: p,
@@ -2380,12 +2415,12 @@ async function exportCompositePdf() {
         const r = pinSizePx / viewport.scale;
         const screenX = pin.pos.x, screenY = pin.pos.y;
         const leaderLen = effLeaderLength(pin.photo);
-        const thumbCx = screenX + pinSizePx + state.thumbSize / 2 + leaderLen;
-        const thumbCy = screenY - pinSizePx - state.thumbSize / 2 - leaderLen;
+        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo);
+        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, pinSizePx, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
 
         const center = pdfPoint(screenX, screenY);
-        const leaderEnd = pdfPoint(thumbCx - state.thumbSize * 0.15, thumbCy + state.thumbSize * 0.15);
-        const rect = pdfRect(thumbCx - state.thumbSize / 2, thumbCy - state.thumbSize / 2, thumbCx + state.thumbSize / 2, thumbCy + state.thumbSize / 2);
+        const leaderEnd = pdfPoint(thumbCx - thumbW * 0.15, thumbCy + thumbH * 0.15);
+        const rect = pdfRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbCx + thumbW / 2, thumbCy + thumbH / 2);
 
         // 引き出し線
         const [lcR, lcG, lcB] = hexToRgbTriple(effLeaderColor(pin.photo));
@@ -2689,10 +2724,9 @@ async function exportExcel() {
 
       for (const pin of pins) {
         const r = effPinSize(pin.photo);
-        const thumb = state.thumbSize;
+        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo);
         const leaderLen = effLeaderLength(pin.photo);
-        const thumbCx = pin.pos.x + r + thumb / 2 + leaderLen;
-        const thumbCy = pin.pos.y - r - thumb / 2 - leaderLen;
+        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, r, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
 
         // 撮影方向の矢印
         {
@@ -2720,7 +2754,7 @@ async function exportExcel() {
         {
           const lw = effLeaderWidth(pin.photo);
           const x1 = pin.pos.x, y1 = pin.pos.y;
-          const x2 = thumbCx - thumb / 2 * 0.3, y2 = thumbCy + thumb / 2 * 0.3;
+          const x2 = thumbCx - thumbW / 2 * 0.3, y2 = thumbCy + thumbH / 2 * 0.3;
           const lc = effLeaderColor(pin.photo);
           const pad = Math.ceil(lw) + 2;
           const minX = Math.min(x1, x2) - pad, minY = Math.min(y1, y2) - pad;
@@ -2740,16 +2774,16 @@ async function exportExcel() {
         {
           const borderW = effThumbBorderWidth(pin.photo);
           const pad = Math.ceil(borderW / 2) + 1;
-          const dataUrl = miniPng(thumb + pad * 2, thumb + pad * 2, (ctx) => {
+          const dataUrl = miniPng(thumbW + pad * 2, thumbH + pad * 2, (ctx) => {
             ctx.fillStyle = "#fff";
-            ctx.fillRect(pad, pad, thumb, thumb);
+            ctx.fillRect(pad, pad, thumbW, thumbH);
             if (borderW > 0) {
               ctx.lineWidth = borderW;
               ctx.strokeStyle = effThumbBorderColor(pin.photo);
-              ctx.strokeRect(pad, pad, thumb, thumb);
+              ctx.strokeRect(pad, pad, thumbW, thumbH);
             }
           });
-          addPng(sheet, dataUrl, thumbCx - thumb / 2 - pad, thumbCy - thumb / 2 - pad, thumb + pad * 2, thumb + pad * 2);
+          addPng(sheet, dataUrl, thumbCx - thumbW / 2 - pad, thumbCy - thumbH / 2 - pad, thumbW + pad * 2, thumbH + pad * 2);
         }
 
         // サムネイル写真本体
@@ -2757,8 +2791,8 @@ async function exportExcel() {
           const inset = effThumbBorderWidth(pin.photo) / 2;
           const imgId = wb.addImage({ base64: pin.photo.thumbDataUrl, extension: "jpeg" });
           sheet.addImage(imgId, {
-            tl: absAnchor(thumbCx - thumb / 2 + inset, thumbCy - thumb / 2 + inset),
-            ext: { width: thumb - inset * 2, height: thumb - inset * 2 },
+            tl: absAnchor(thumbCx - thumbW / 2 + inset, thumbCy - thumbH / 2 + inset),
+            ext: { width: thumbW - inset * 2, height: thumbH - inset * 2 },
           });
         }
 
