@@ -1003,12 +1003,23 @@ function removeDayCompareCandidate(originId, roundIdx, photoId) {
 }
 // 現在のstate.dayCompareRows(候補を手動で間引いた結果)に基づき、2回目以降の写真のピン番号を
 // 実際に書き換える。1回目(roundCandidates[0])の番号は一切変更しない。
+// マッチした写真(新規番号になったものを除く)は、矢印の向き・太さ・長さ・色を
+// その地点を最初に登録した写真(origin。多くの場合1回目だが、2回目以降で新規登録された
+// 地点ならその写真)に合わせる。origin自身(=新規番号になったもの)は変更しない。
 function applyDayCompareLabels() {
   for (const row of state.dayCompareRows) {
+    const originPhoto = state.photos.find((p) => p.id === row.originId);
     for (let roundIdx = 1; roundIdx < row.roundCandidates.length; roundIdx++) {
       for (const pid of row.roundCandidates[roundIdx]) {
         const photo = state.photos.find((p) => p.id === pid);
-        if (photo) photo.numberLabel = row.label;
+        if (!photo) continue;
+        photo.numberLabel = row.label;
+        if (originPhoto && photo.id !== originPhoto.id) {
+          photo.directionDeg = originPhoto.directionDeg;
+          photo.arrowWidthOverride = effArrowWidth(originPhoto);
+          photo.arrowLengthOverride = effArrowLength(originPhoto);
+          photo.arrowColorOverride = effArrowColor(originPhoto);
+        }
       }
     }
   }
