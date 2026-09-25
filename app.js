@@ -59,6 +59,7 @@ const state = {
   draggingArrow: null, // photo id whose direction arrow is being dragged
   draggingThumb: null, // photo id whose thumbnail(だけ)を移動中
   draggingLayer: false,
+  draggingResize: null, // 写真レイヤー枠の辺・角をドラッグ中の情報(hitTestLayerHandleの戻り値)
   dragLast: null,
 
   calibrating: false,
@@ -1409,26 +1410,31 @@ const ARROW_HEAD_ANGLE = 26; // deg
 
 // 矢印が太いほど先端の矢じりも大きくする(細いままだとただの棒に見えるため)。
 // ただし矢印本体より長くなりすぎないよう、全長の70%を上限とする。
-function arrowHeadLength(width, shaftLength) {
-  const base = Math.max(ARROW_HEAD_LEN, width * 4);
+// zoomFactorはPDF拡縮に対する見た目の大きさの補正(下記eff*関数と同じ)。
+function arrowHeadLength(width, shaftLength, zoomFactor) {
+  const zf = zoomFactor || 1;
+  const base = Math.max(ARROW_HEAD_LEN * zf, width * 4);
   return Math.min(base, shaftLength * 0.7);
 }
 
-// 一括設定(state.xxx)を基本とし、写真ごとの個別上書き(xxxOverride)があればそちらを優先する
-function effPinSize(p) { return p.pinSizeOverride != null ? p.pinSizeOverride : state.pinSize; }
-function effLeaderWidth(p) { return p.leaderWidthOverride != null ? p.leaderWidthOverride : state.leaderLineWidth; }
-function effLeaderLength(p) { return p.leaderLengthOverride != null ? p.leaderLengthOverride : state.leaderLineLength; }
+// 一括設定(state.xxx)を基本とし、写真ごとの個別上書き(xxxOverride)があればそちらを優先する。
+// zoomFactor(既定1)を掛けることで、PDFの表示倍率を変えても図面に対する見た目の大きさが
+// 変わらないようにする(呼び出し側でそのページのview.zoom/100を渡す)。
+function effPinSize(p, zoomFactor) { return (p.pinSizeOverride != null ? p.pinSizeOverride : state.pinSize) * (zoomFactor || 1); }
+function effLeaderWidth(p, zoomFactor) { return (p.leaderWidthOverride != null ? p.leaderWidthOverride : state.leaderLineWidth) * (zoomFactor || 1); }
+function effLeaderLength(p, zoomFactor) { return (p.leaderLengthOverride != null ? p.leaderLengthOverride : state.leaderLineLength) * (zoomFactor || 1); }
 function effLeaderColor(p) { return p.leaderColorOverride != null ? p.leaderColorOverride : state.leaderLineColor; }
-function effArrowWidth(p) { return p.arrowWidthOverride != null ? p.arrowWidthOverride : state.arrowWidth; }
-function effArrowLength(p) { return p.arrowLengthOverride != null ? p.arrowLengthOverride : state.arrowLength; }
+function effArrowWidth(p, zoomFactor) { return (p.arrowWidthOverride != null ? p.arrowWidthOverride : state.arrowWidth) * (zoomFactor || 1); }
+function effArrowLength(p, zoomFactor) { return (p.arrowLengthOverride != null ? p.arrowLengthOverride : state.arrowLength) * (zoomFactor || 1); }
 function effArrowColor(p) { return p.arrowColorOverride != null ? p.arrowColorOverride : state.arrowColor; }
-function effThumbBorderWidth(p) { return p.thumbBorderWidthOverride != null ? p.thumbBorderWidthOverride : state.thumbBorderWidth; }
+function effThumbBorderWidth(p, zoomFactor) { return (p.thumbBorderWidthOverride != null ? p.thumbBorderWidthOverride : state.thumbBorderWidth) * (zoomFactor || 1); }
 function effThumbBorderColor(p) { return p.thumbBorderColorOverride != null ? p.thumbBorderColorOverride : state.thumbBorderColor; }
 
 // サムネイル枠のサイズ(px)。state.thumbSize(スライダー)を長辺の目安とし、
 // 元写真の縦横比(photo.aspectRatio)を保ったまま短辺を縮める(引き伸ばし・切り抜きをしない)。
-function thumbBoxSize(photo, sizePx) {
-  const base = sizePx != null ? sizePx : state.thumbSize;
+// sizePxを渡さない場合はstate.thumbSizeにzoomFactorを掛けたものを使う(PDF拡縮で見た目が変わらないように)。
+function thumbBoxSize(photo, sizePx, zoomFactor) {
+  const base = sizePx != null ? sizePx : state.thumbSize * (zoomFactor || 1);
   const ar = photo.aspectRatio || 1;
   return ar >= 1 ? { w: base, h: base / ar } : { w: base * ar, h: base };
 }
@@ -1545,19 +1551,23 @@ function drawLayerBoundsOverlay(ctx, photosOnPage, t, canvas, viewRotation) {
 
 function drawPin(ctx, pin) {
   const { pos, photo, index, dir } = pin;
-  const r = effPinSize(photo);
-  const { w: thumbW, h: thumbH } = thumbBoxSize(photo);
-  const leaderLen = effLeaderLength(photo);
+  // PDFの表示倍率を変えても図面に対する見た目の大きさ(サムネ・ピン・矢印・引き出し線)が
+  // 変わらないよう、そのページの倍率ぶんを掛けて拡縮する。
+  const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
+  const r = effPinSize(photo, zoomFactor);
+  const { w: thumbW, h: thumbH } = thumbBoxSize(photo, null, zoomFactor);
+  const leaderLen = effLeaderLength(photo, zoomFactor);
   const { x: thumbCx, y: thumbCy } = thumbCenter(pos, r, thumbW, thumbH, leaderLen, photo.thumbOffset);
 
   // 撮影方向の矢印
   const arrowCol = effArrowColor(photo);
-  const arrowLen = effArrowLength(photo);
-  const arrow = arrowGeometry(pos.x, pos.y, dir, arrowLen, arrowHeadLength(effArrowWidth(photo), arrowLen));
+  const arrowLen = effArrowLength(photo, zoomFactor);
+  const arrowW = effArrowWidth(photo, zoomFactor);
+  const arrow = arrowGeometry(pos.x, pos.y, dir, arrowLen, arrowHeadLength(arrowW, arrowLen, zoomFactor));
   ctx.save();
   ctx.strokeStyle = arrowCol;
   ctx.fillStyle = arrowCol;
-  ctx.lineWidth = effArrowWidth(photo);
+  ctx.lineWidth = arrowW;
   ctx.beginPath();
   ctx.moveTo(arrow.base.x, arrow.base.y);
   ctx.lineTo(arrow.tip.x, arrow.tip.y);
@@ -1573,7 +1583,7 @@ function drawPin(ctx, pin) {
   // 引き出し線
   ctx.save();
   ctx.strokeStyle = effLeaderColor(photo);
-  ctx.lineWidth = effLeaderWidth(photo);
+  ctx.lineWidth = effLeaderWidth(photo, zoomFactor);
   ctx.beginPath();
   ctx.moveTo(pos.x, pos.y);
   ctx.lineTo(thumbCx - thumbW / 2 * 0.3, thumbCy + thumbH / 2 * 0.3);
@@ -1582,7 +1592,7 @@ function drawPin(ctx, pin) {
 
   // サムネイル（フチ付き。元写真の縦横比のまま表示する）
   const img = pin.photo._imgEl || getCachedImage(photo);
-  const borderW = effThumbBorderWidth(photo);
+  const borderW = effThumbBorderWidth(photo, zoomFactor);
   const inset = borderW / 2;
   ctx.save();
   ctx.fillStyle = "#fff";
@@ -1699,12 +1709,86 @@ function onCanvasMouseDown(e) {
     state.dragLast = pos;
     return;
   }
+  // 写真レイヤーの枠(赤い四角)の辺・角をつかんで拡縮できるようにする。
+  // 角=等アスペクトで拡縮(反対の角が基点)、上下の辺=縦だけ、左右の辺=横だけ拡縮(反対の辺が基点)。
+  const handle = hitTestLayerHandle(pos);
+  if (handle) {
+    state.draggingResize = handle;
+    return;
+  }
   // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
   // それ以外でも写真レイヤーの枠(基準線)を直接つまんでドラッグすれば移動できるようにする。
   if (state.layerPanMode || hitTestLayerBounds(pos)) {
     state.draggingLayer = true;
     state.dragLast = pos;
   }
+}
+// 2点p1-p2を結ぶ線分と点posとの最短距離、および線分上での位置(0=p1側の端,1=p2側の端)を返す
+function distToSegment(pos, p1, p2) {
+  const abx = p2.x - p1.x, aby = p2.y - p1.y;
+  const lenSq = abx * abx + aby * aby;
+  let segT = lenSq > 0 ? ((pos.x - p1.x) * abx + (pos.y - p1.y) * aby) / lenSq : 0;
+  segT = Math.max(0, Math.min(1, segT));
+  const cx = p1.x + abx * segT, cy = p1.y + aby * segT;
+  return { dist: Math.hypot(pos.x - cx, pos.y - cy), segT };
+}
+// 写真レイヤーの枠(drawLayerBoundsOverlayと同じ四角形)の角・辺のうち、posの近くにあるものを返す。
+// 角=均等拡縮(axis:null)、辺=その辺と垂直な向きだけの拡縮(axis:"x"|"y")。fixedBaseは
+// 反対側の角/辺上の基準点(base座標)で、ドラッグ中はこの点の画面位置を固定したまま拡縮する。
+function hitTestLayerHandle(pos) {
+  const photosOnPage = getPagePhotos(state.currentPage);
+  if (photosOnPage.length < 2) return null;
+  const t = getPageTransform(state.currentPage);
+  const bb = getEffectiveBaseBBox(photosOnPage);
+  const cornerAt = (bx, by) => transformPoint({ baseX: bx, baseY: by, manualOffset: null }, photosOnPage, t);
+  const tl = cornerAt(bb.minX, bb.minY), tr = cornerAt(bb.maxX, bb.minY);
+  const bl = cornerAt(bb.minX, bb.maxY), br = cornerAt(bb.maxX, bb.maxY);
+
+  const CORNER_R = 10, EDGE_R = 8;
+  const corners = [
+    { pt: tl, fixedBase: { x: bb.maxX, y: bb.maxY } }, // 左上をつまむ → 右下が基点
+    { pt: tr, fixedBase: { x: bb.minX, y: bb.maxY } }, // 右上 → 左下が基点
+    { pt: bl, fixedBase: { x: bb.maxX, y: bb.minY } }, // 左下 → 右上が基点
+    { pt: br, fixedBase: { x: bb.minX, y: bb.minY } }, // 右下 → 左上が基点
+  ];
+  for (const c of corners) {
+    if (Math.hypot(pos.x - c.pt.x, pos.y - c.pt.y) <= CORNER_R) {
+      return {
+        kind: "corner", axis: null, pageIndex: state.currentPage,
+        fixedBase: c.fixedBase, fixedScreen: cornerAt(c.fixedBase.x, c.fixedBase.y),
+        dragStartScreen: pos,
+        startScale: t.scale, startScaleX: t.scaleX || 1, startScaleY: t.scaleY || 1,
+      };
+    }
+  }
+  const edges = [
+    { a: tl, b: tr, axis: "y", fixedBase: { x: bb.minX, y: bb.maxY } }, // 上辺 → 下辺が基点、縦だけ拡縮
+    { a: bl, b: br, axis: "y", fixedBase: { x: bb.minX, y: bb.minY } }, // 下辺 → 上辺が基点
+    { a: tl, b: bl, axis: "x", fixedBase: { x: bb.maxX, y: bb.minY } }, // 左辺 → 右辺が基点、横だけ拡縮
+    { a: tr, b: br, axis: "x", fixedBase: { x: bb.minX, y: bb.minY } }, // 右辺 → 左辺が基点
+  ];
+  for (const e of edges) {
+    const { dist, segT } = distToSegment(pos, e.a, e.b);
+    if (dist <= EDGE_R && segT > 0.12 && segT < 0.88) {
+      return {
+        kind: "edge", axis: e.axis, pageIndex: state.currentPage,
+        fixedBase: e.fixedBase, fixedScreen: cornerAt(e.fixedBase.x, e.fixedBase.y),
+        dragStartScreen: pos,
+        startScale: t.scale, startScaleX: t.scaleX || 1, startScaleY: t.scaleY || 1,
+      };
+    }
+  }
+  return null;
+}
+// 基準点(base座標)fixedBaseの画面上の位置がtargetScreenのまま変わらないように、
+// t.scale/scaleX/scaleY/rotationDeg(呼び出し前に設定済みの値)を保ったoffsetX/offsetYを逆算する。
+// 拡縮の基点をレイヤー枠の角・辺のドラッグに応じて自由に選べるようにするための汎用関数
+// (transformPointと同じ変換式を、基点となる点についてoffsetだけ未知数として解いたもの)。
+function computeOffsetForFixedPoint(photosOnPage, t, fixedBase, targetScreen) {
+  const withoutOffset = transformPoint(
+    { baseX: fixedBase.x, baseY: fixedBase.y, manualOffset: null },
+    photosOnPage, { ...t, offsetX: 0, offsetY: 0 });
+  return { offsetX: targetScreen.x - withoutOffset.x, offsetY: targetScreen.y - withoutOffset.y };
 }
 // 現在のページの写真レイヤーの範囲(drawLayerBoundsOverlayと同じ四角形)内に
 // 画面座標posが含まれるかどうかを判定する。回転していても正しく判定できるよう、
@@ -1729,12 +1813,13 @@ function hitTestLayerBounds(pos) {
 }
 function hitTestPin(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
+  const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
   for (let i = photosOnPage.length - 1; i >= 0; i--) {
     const p = photosOnPage[i];
     const sp = p._screenPos;
     if (!sp) continue;
     const d = Math.hypot(pos.x - sp.x, pos.y - sp.y);
-    if (d <= effPinSize(p) + 3) return p;
+    if (d <= effPinSize(p, zoomFactor) + 3) return p;
   }
   return null;
 }
@@ -1742,13 +1827,14 @@ function hitTestPin(pos) {
 // サムネイル画像からも開けるようにするため)
 function hitTestThumbnail(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
+  const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
   for (let i = photosOnPage.length - 1; i >= 0; i--) {
     const p = photosOnPage[i];
     const sp = p._screenPos;
     if (!sp) continue;
-    const r = effPinSize(p);
-    const { w: thumbW, h: thumbH } = thumbBoxSize(p);
-    const leaderLen = effLeaderLength(p);
+    const r = effPinSize(p, zoomFactor);
+    const { w: thumbW, h: thumbH } = thumbBoxSize(p, null, zoomFactor);
+    const leaderLen = effLeaderLength(p, zoomFactor);
     const { x: thumbCx, y: thumbCy } = thumbCenter(sp, r, thumbW, thumbH, leaderLen, p.thumbOffset);
     if (pos.x >= thumbCx - thumbW / 2 && pos.x <= thumbCx + thumbW / 2
       && pos.y >= thumbCy - thumbH / 2 && pos.y <= thumbCy + thumbH / 2) {
@@ -1759,19 +1845,49 @@ function hitTestThumbnail(pos) {
 }
 function hitTestArrowTip(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
+  const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
   for (let i = photosOnPage.length - 1; i >= 0; i--) {
     const p = photosOnPage[i];
     const sp = p._screenPos;
     if (!sp || p._screenDir == null) continue;
-    const tip = arrowGeometry(sp.x, sp.y, p._screenDir, effArrowLength(p)).tip;
+    const tip = arrowGeometry(sp.x, sp.y, p._screenDir, effArrowLength(p, zoomFactor)).tip;
     const d = Math.hypot(pos.x - tip.x, pos.y - tip.y);
     if (d <= 9) return p;
   }
   return null;
 }
 function onCanvasMouseMove(e) {
-  if (!state.draggingPin && !state.draggingLayer && !state.draggingArrow && !state.draggingThumb) return;
+  if (!state.draggingPin && !state.draggingLayer && !state.draggingArrow && !state.draggingThumb && !state.draggingResize) return;
   const pos = canvasPosFromEvent(e);
+  if (state.draggingResize) {
+    const dr = state.draggingResize;
+    const t = getPageTransform(dr.pageIndex);
+    const photosOnPage = getPagePhotos(dr.pageIndex);
+    if (dr.kind === "corner") {
+      const toFixed = (p) => Math.hypot(p.x - dr.fixedScreen.x, p.y - dr.fixedScreen.y);
+      const startDist = toFixed(dr.dragStartScreen);
+      const ratio = startDist > 1e-6 ? toFixed(pos) / startDist : 1;
+      t.scale = Math.min(sliderToScale(300), Math.max(sliderToScale(-300), dr.startScale * ratio));
+    } else {
+      // 辺のドラッグ：回転後のその辺と垂直な向き(縦なら回転後の縦方向、横なら回転後の横方向)への
+      // 移動量だけを見て、その軸(scaleXまたはscaleY)だけを拡縮する。
+      const rad = t.rotationDeg * Math.PI / 180;
+      const dirVec = dr.axis === "y"
+        ? { x: -Math.sin(rad), y: Math.cos(rad) }
+        : { x: Math.cos(rad), y: Math.sin(rad) };
+      const proj = (p) => (p.x - dr.fixedScreen.x) * dirVec.x + (p.y - dr.fixedScreen.y) * dirVec.y;
+      const startProj = proj(dr.dragStartScreen);
+      const ratio = Math.abs(startProj) > 1e-6 ? proj(pos) / startProj : 1;
+      if (dr.axis === "y") t.scaleY = Math.min(3, Math.max(0.2, dr.startScaleY * ratio));
+      else t.scaleX = Math.min(3, Math.max(0.2, dr.startScaleX * ratio));
+    }
+    const newOffset = computeOffsetForFixedPoint(photosOnPage, t, dr.fixedBase, dr.fixedScreen);
+    t.offsetX = newOffset.offsetX;
+    t.offsetY = newOffset.offsetY;
+    syncLayerControlsToCurrentPage();
+    renderPins();
+    return;
+  }
   if (state.draggingArrow) {
     const photo = state.photos.find((p) => p.id === state.draggingArrow);
     const sp = photo._screenPos;
@@ -1815,6 +1931,7 @@ function onCanvasMouseUp() {
   state.draggingArrow = null;
   state.draggingThumb = null;
   state.draggingLayer = false;
+  state.draggingResize = null;
   state.dragLast = null;
 }
 
@@ -2494,11 +2611,17 @@ async function exportCompositePdf() {
       }));
 
       for (const pin of pins) {
-        const pinSizePx = effPinSize(pin.photo);
-        const r = pinSizePx / viewport.scale;
+        // 位置(pos)の計算に足し込むサイズはviewport.scale(=そのページの表示倍率)ぶん
+        // 拡大してから最終的にpdfPoint()で点(pt)に変換することで、編集時の表示倍率に
+        // 関係なく図面に対する見た目の大きさが一定になるようにする。一方、線の太さ・
+        // 半径など「変換を経ずに直接pt値として使う」ものは、素のeffXxx()の値をそのまま使う
+        // (zoomFactorを掛けない=常に一定)。
+        const zf = viewport.scale;
+        const pinSizePx = effPinSize(pin.photo, zf); // 位置計算用(拡大済み)
+        const r = effPinSize(pin.photo); // 半径そのもの(pt、一定)
         const screenX = pin.pos.x, screenY = pin.pos.y;
-        const leaderLen = effLeaderLength(pin.photo);
-        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo);
+        const leaderLen = effLeaderLength(pin.photo, zf);
+        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
         const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, pinSizePx, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
 
         const center = pdfPoint(screenX, screenY);
@@ -2521,14 +2644,14 @@ async function exportCompositePdf() {
           x: rect.x, y: rect.y, width: rect.width, height: rect.height,
           color: rgb(1, 1, 1), borderColor: rgb(bR, bG, bB), borderWidth: borderWpx,
         });
-        const inset = (borderWpx / 2) / viewport.scale;
+        const inset = borderWpx / 2;
         page.drawImage(embedded, {
           x: rect.x + inset, y: rect.y + inset, width: rect.width - inset * 2, height: rect.height - inset * 2,
         });
 
         // 撮影方向の矢印
-        const pinArrowLen = effArrowLength(pin.photo);
-        const arrow = arrowGeometry(screenX, screenY, pin.dir, pinArrowLen, arrowHeadLength(effArrowWidth(pin.photo), pinArrowLen));
+        const pinArrowLen = effArrowLength(pin.photo, zf);
+        const arrow = arrowGeometry(screenX, screenY, pin.dir, pinArrowLen, arrowHeadLength(effArrowWidth(pin.photo, zf), pinArrowLen, zf));
         const aBase = pdfPoint(arrow.base.x, arrow.base.y);
         const aTip = pdfPoint(arrow.tip.x, arrow.tip.y);
         const aWing1 = pdfPoint(arrow.wing1.x, arrow.wing1.y);
@@ -2789,17 +2912,20 @@ async function exportExcel() {
         dir: normalizeAngle(p.directionDeg + t.rotationDeg),
       }));
 
+      // PDFの表示倍率を変えても図面に対する見た目の大きさが変わらないよう、
+      // そのページの倍率ぶんを掛けて拡縮する(プレビューのdrawPinと同じ考え方)。
+      const zf = view.zoom / 100;
       for (const pin of pins) {
-        const r = effPinSize(pin.photo);
-        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo);
-        const leaderLen = effLeaderLength(pin.photo);
+        const r = effPinSize(pin.photo, zf);
+        const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
+        const leaderLen = effLeaderLength(pin.photo, zf);
         const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, r, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
 
         // 撮影方向の矢印
         {
-          const xlArrowLen = effArrowLength(pin.photo);
-          const arrow = arrowGeometry(pin.pos.x, pin.pos.y, pin.dir, xlArrowLen, arrowHeadLength(effArrowWidth(pin.photo), xlArrowLen));
-          const w0 = effArrowWidth(pin.photo);
+          const xlArrowLen = effArrowLength(pin.photo, zf);
+          const arrow = arrowGeometry(pin.pos.x, pin.pos.y, pin.dir, xlArrowLen, arrowHeadLength(effArrowWidth(pin.photo, zf), xlArrowLen, zf));
+          const w0 = effArrowWidth(pin.photo, zf);
           const pts = [arrow.base, arrow.tip, arrow.wing1, arrow.wing2];
           const pad = Math.ceil(w0) + 3;
           const minX = Math.min(...pts.map((p) => p.x)) - pad;
@@ -2819,7 +2945,7 @@ async function exportExcel() {
 
         // 引き出し線
         {
-          const lw = effLeaderWidth(pin.photo);
+          const lw = effLeaderWidth(pin.photo, zf);
           const x1 = pin.pos.x, y1 = pin.pos.y;
           const x2 = thumbCx - thumbW / 2 * 0.3, y2 = thumbCy + thumbH / 2 * 0.3;
           const lc = effLeaderColor(pin.photo);
@@ -2839,7 +2965,7 @@ async function exportExcel() {
 
         // サムネイルの縁(背景+枠線)
         {
-          const borderW = effThumbBorderWidth(pin.photo);
+          const borderW = effThumbBorderWidth(pin.photo, zf);
           const pad = Math.ceil(borderW / 2) + 1;
           const dataUrl = miniPng(thumbW + pad * 2, thumbH + pad * 2, (ctx) => {
             ctx.fillStyle = "#fff";
@@ -2855,7 +2981,7 @@ async function exportExcel() {
 
         // サムネイル写真本体
         {
-          const inset = effThumbBorderWidth(pin.photo) / 2;
+          const inset = effThumbBorderWidth(pin.photo, zf) / 2;
           const imgId = wb.addImage({ base64: pin.photo.thumbDataUrl, extension: "jpeg" });
           sheet.addImage(imgId, {
             tl: absAnchor(thumbCx - thumbW / 2 + inset, thumbCy - thumbH / 2 + inset),
