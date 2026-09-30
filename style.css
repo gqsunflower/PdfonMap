@@ -187,11 +187,13 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   overflow: auto;
   position: relative;
   display: flex;
-  align-items: center;
-  justify-content: center;
   padding: 24px;
 }
-#canvasStack { position: relative; box-shadow: 0 2px 10px rgba(0,0,0,.18); background: #fff; }
+/* 中央寄せはalign-items/justify-content:centerではなくmargin:autoで行う。
+   flexの中央寄せは拡大時にコンテンツが枠より大きくなると、はみ出した分の一部が
+   スクロールしても届かなくなる(開始側の負のスクロール位置を作れないため)既知の問題があるため。 */
+#canvasStack { position: relative; box-shadow: 0 2px 10px rgba(0,0,0,.18); background: #fff; margin: auto; }
+#viewerHint { margin: auto; }
 #pdfCanvas, #pinCanvas { display: block; }
 #pinCanvas { position: absolute; top: 0; left: 0; }
 
@@ -312,6 +314,42 @@ label input[type=range] { vertical-align: middle; }
 .valInput:focus { outline: none; border-color: var(--accent); }
 
 #pageListBlock, #trashBlock { margin-top: 12px; }
+
+/* サムネイルのダブルクリックで開く拡大表示 */
+.lightboxOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: rgba(0, 0, 0, 0.82);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px;
+  cursor: zoom-out;
+}
+.lightboxOverlay img {
+  max-width: 100%;
+  max-height: 100%;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  border-radius: 4px;
+  cursor: default;
+}
+.lightboxClose {
+  position: fixed;
+  top: 16px;
+  right: 20px;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.15);
+  color: #fff;
+  border: none;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+}
+.lightboxClose:hover { background: rgba(255, 255, 255, 0.3); }
+.photoRow img { cursor: zoom-in; }
 
 /* 日付比較ページ(列=回、行=地点のグリッド表示。列数は撮影回の数だけ動的に増える) */
 .compareView {

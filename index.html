@@ -26,7 +26,7 @@
       </div>
       <div id="compareView" class="compareView" hidden></div>
       <div id="calibHint" class="hint" hidden></div>
-      <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。同じ地点の写真が重なるときは、写真自体をドラッグするとピンの位置は変えずに写真だけずらせます。</div>
+      <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。同じ地点の写真が重なるときは、写真自体をドラッグするとピンの位置は変えずに写真だけずらせます。写真（サムネイル）をダブルクリックすると拡大表示できます。</div>
     </section>
 
     <div id="splitHandle" title="ドラッグして幅を調整"></div>
@@ -235,6 +235,11 @@
       <button type="button" data-reset="thumbBorderColorOverride">既定</button>
     </div>
     <button type="button" id="pdCloseBtn" class="primary">閉じる</button>
+  </div>
+
+  <div id="photoLightbox" class="lightboxOverlay" hidden>
+    <img id="lightboxImg" alt="">
+    <button type="button" id="lightboxCloseBtn" class="lightboxClose" title="閉じる">×</button>
   </div>
 </div>
 

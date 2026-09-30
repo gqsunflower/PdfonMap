@@ -69,6 +69,8 @@ const state = {
   selectedPhotoIds: [], // 一覧で複数選択中の写真id（一括ページ移動・一括削除用）
   lastClickedPhotoId: null, // shift+クリックの範囲選択の基点
 
+  undoStack: [], // Ctrl+Zで戻すための直近の状態(最大2件、古いものから)
+
   currentProjectDirHandle: null, // 直前に読込み/保存したプロジェクトフォルダ(FileSystemDirectoryHandle)。「保存(上書)」用
   currentProjectName: null,
 
@@ -83,10 +85,123 @@ const state = {
 
 const el = (id) => document.getElementById(id);
 
+// ---------- Ctrl+Zでの取り消し(直近2件まで) ----------
+// ピン・写真・レイヤー変形・ページ構成など「編集」に関わる状態だけを対象にする
+// (PDF/写真の読み込み・削除といった大きな構造の変更まではここでは戻さない)。
+const UNDO_MAX = 2;
+const UNDO_COOLDOWN_MS = 500; // 連続ドラッグ・スライダー操作をまとめて1操作として扱うための間隔
+let lastUndoPushAt = 0;
+function snapshotPhotoForUndo(p) {
+  return {
+    ...p,
+    manualOffset: p.manualOffset ? { ...p.manualOffset } : null,
+    thumbOffset: p.thumbOffset ? { ...p.thumbOffset } : null,
+  };
+}
+function cloneStateForUndo() {
+  return {
+    photos: state.photos.map(snapshotPhotoForUndo),
+    pageTransform: new Map([...state.pageTransform].map(([k, v]) => [k, { ...v }])),
+    pageView: new Map([...state.pageView].map(([k, v]) => [k, { ...v }])),
+    pages: state.pages.map((pg) => ({ ...pg })),
+    dayCompareRows: state.dayCompareRows.map((r) => ({ ...r, roundCandidates: r.roundCandidates.map((ids) => [...ids]) })),
+    dayCompareRoundLabels: [...state.dayCompareRoundLabels],
+    nextPhotoId: state.nextPhotoId,
+    currentPage: state.currentPage,
+    thumbSize: state.thumbSize,
+    pinSize: state.pinSize,
+    leaderLineWidth: state.leaderLineWidth,
+    leaderLineLength: state.leaderLineLength,
+    leaderLineColor: state.leaderLineColor,
+    arrowWidth: state.arrowWidth,
+    arrowLength: state.arrowLength,
+    arrowColor: state.arrowColor,
+    thumbBorderWidth: state.thumbBorderWidth,
+    thumbBorderColor: state.thumbBorderColor,
+  };
+}
+// 変更を加える直前に呼び、そのときの状態を控えておく。短時間(ドラッグ中の連続呼び出しや
+// スライダーを動かしている間など)に何度呼ばれても、直前の記録から一定時間内なら
+// 記録し直さない(ひとまとまりの操作として扱う)。
+function pushUndoSnapshot() {
+  const now = Date.now();
+  if (now - lastUndoPushAt < UNDO_COOLDOWN_MS) return;
+  lastUndoPushAt = now;
+  state.undoStack.push(cloneStateForUndo());
+  if (state.undoStack.length > UNDO_MAX) state.undoStack.shift();
+}
+function undoLastAction() {
+  if (!state.undoStack.length) return;
+  const snap = state.undoStack.pop();
+  state.photos = snap.photos;
+  state.pageTransform = snap.pageTransform;
+  state.pageView = snap.pageView;
+  state.pages = snap.pages;
+  state.dayCompareRows = snap.dayCompareRows;
+  state.dayCompareRoundLabels = snap.dayCompareRoundLabels;
+  state.nextPhotoId = snap.nextPhotoId;
+  state.thumbSize = snap.thumbSize;
+  state.pinSize = snap.pinSize;
+  state.leaderLineWidth = snap.leaderLineWidth;
+  state.leaderLineLength = snap.leaderLineLength;
+  state.leaderLineColor = snap.leaderLineColor;
+  state.arrowWidth = snap.arrowWidth;
+  state.arrowLength = snap.arrowLength;
+  state.arrowColor = snap.arrowColor;
+  state.thumbBorderWidth = snap.thumbBorderWidth;
+  state.thumbBorderColor = snap.thumbBorderColor;
+  lastUndoPushAt = 0; // 直後の操作をすぐ別枠として記録できるようにする
+
+  syncGlobalSettingInputs();
+  imageCache.clear();
+  buildPageList();
+  if (state.currentPage === "compare") {
+    renderComparePage();
+  } else {
+    const visible = visiblePages();
+    const target = visible.some((pg) => pg.srcIndex === snap.currentPage) ? snap.currentPage : (visible[0] ? visible[0].srcIndex : null);
+    if (target != null) gotoPage(target); else renderPins();
+  }
+  renderPhotoList();
+  updateDayCompareStatus();
+  el("exportStatus").textContent = "";
+}
+// 一括設定(サムネ・ピン・引き出し線・矢印)のスライダー表示をstateの値に合わせ直す
+function syncGlobalSettingInputs() {
+  el("thumbSize").value = state.thumbSize;
+  el("thumbSizeVal").value = state.thumbSize;
+  el("thumbBorderWidth").value = state.thumbBorderWidth;
+  el("thumbBorderWidthVal").value = state.thumbBorderWidth;
+  el("thumbBorderColor").value = state.thumbBorderColor;
+  el("pinSize").value = state.pinSize;
+  el("pinSizeVal").value = state.pinSize;
+  el("leaderWidth").value = state.leaderLineWidth;
+  el("leaderWidthVal").value = state.leaderLineWidth;
+  el("leaderLength").value = state.leaderLineLength;
+  el("leaderLengthVal").value = state.leaderLineLength;
+  el("leaderColor").value = state.leaderLineColor;
+  el("arrowWidth").value = state.arrowWidth;
+  el("arrowWidthVal").value = state.arrowWidth;
+  el("arrowLength").value = state.arrowLength;
+  el("arrowLengthVal").value = state.arrowLength;
+  el("arrowColor").value = state.arrowColor;
+}
+
 // ---------- 初期化 ----------
 function init() {
   wireDropzone(el("pdfDrop"), el("pdfInput"), el("pdfPickBtn"), onPdfFiles);
   wireDropzone(el("photoDrop"), el("photoInput"), el("photoPickBtn"), onPhotoFiles);
+
+  // Ctrl+Z(Macはcmd+Z)で直近2件までの操作を取り消す。テキスト入力欄では
+  // ブラウザ標準のテキスト編集Undoを優先し、こちらは発動させない。
+  window.addEventListener("keydown", (e) => {
+    if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
+      const tag = document.activeElement && document.activeElement.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      e.preventDefault();
+      undoLastAction();
+    }
+  });
 
   el("prevPageBtn").addEventListener("click", () => {
     const target = adjacentVisiblePage(state.currentPage, -1);
@@ -109,6 +224,7 @@ function init() {
   });
 
   el("layerScale").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scale = sliderToScale(Number(e.target.value));
     el("layerScaleVal").value = t.scale.toFixed(2);
@@ -118,6 +234,7 @@ function init() {
     let val = Number(e.target.value);
     if (!isFinite(val) || val <= 0) val = 1;
     val = Math.min(100, Math.max(0.01, val));
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scale = val;
     el("layerScale").value = scaleToSlider(val);
@@ -126,6 +243,7 @@ function init() {
   });
 
   el("layerScaleY").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scaleY = Number(e.target.value);
     el("layerScaleYVal").value = t.scaleY.toFixed(2);
@@ -135,6 +253,7 @@ function init() {
     let val = Number(e.target.value);
     if (!isFinite(val) || val <= 0) val = 1;
     val = Math.min(3, Math.max(0.2, val));
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scaleY = val;
     el("layerScaleY").value = val;
@@ -142,6 +261,7 @@ function init() {
     renderPins();
   });
   el("layerScaleX").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scaleX = Number(e.target.value);
     el("layerScaleXVal").value = t.scaleX.toFixed(2);
@@ -151,6 +271,7 @@ function init() {
     let val = Number(e.target.value);
     if (!isFinite(val) || val <= 0) val = 1;
     val = Math.min(3, Math.max(0.2, val));
+    pushUndoSnapshot();
     const t = getPageTransform(state.currentPage);
     t.scaleX = val;
     el("layerScaleX").value = val;
@@ -172,6 +293,7 @@ function init() {
     renderPins();
   });
   el("thumbBorderColor").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     state.thumbBorderColor = e.target.value;
     renderPins();
   });
@@ -188,6 +310,7 @@ function init() {
     renderPins();
   });
   el("leaderColor").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     state.leaderLineColor = e.target.value;
     renderPins();
   });
@@ -200,11 +323,13 @@ function init() {
     renderPins();
   });
   el("arrowColor").addEventListener("input", (e) => {
+    pushUndoSnapshot();
     state.arrowColor = e.target.value;
     renderPins();
   });
 
   initPinDetailPanel();
+  initPhotoLightbox();
 
   el("layerPanBtn").addEventListener("click", () => {
     state.layerPanMode = !state.layerPanMode;
@@ -410,6 +535,7 @@ function wireRangeWithNumber(rangeId, numberId, onChange) {
   const min = Number(range.min), max = Number(range.max);
   const apply = (val) => {
     val = Math.min(max, Math.max(min, val));
+    pushUndoSnapshot();
     range.value = val;
     number.value = val;
     onChange(val);
@@ -557,6 +683,7 @@ function movePageInOrder(srcIndex, direction) {
     neighborIdx += direction;
   }
   if (neighborIdx < 0 || neighborIdx >= state.pages.length) return;
+  pushUndoSnapshot();
   const tmp = state.pages[fullIdx];
   state.pages[fullIdx] = state.pages[neighborIdx];
   state.pages[neighborIdx] = tmp;
@@ -572,6 +699,7 @@ function trashPage(srcIndex) {
   if (photoCount > 0 && !confirm(`このページには写真が${photoCount}枚配置されています。ゴミ箱へ移動しますか？\n(写真の配置情報は保持され、「復元」でいつでも元に戻せます)`)) {
     return;
   }
+  pushUndoSnapshot();
   pg.trashed = true;
   if (state.currentPage === srcIndex) {
     const next = visiblePages()[0];
@@ -594,6 +722,7 @@ function trashPage(srcIndex) {
 function restorePage(srcIndex) {
   const pg = state.pages.find((p) => p.srcIndex === srcIndex);
   if (!pg) return;
+  pushUndoSnapshot();
   pg.trashed = false;
   if (state.currentPage < 0) {
     el("viewerHint").hidden = true;
@@ -1193,6 +1322,10 @@ function renderPhotoList() {
       <span class="pageBadge" style="${pageBadgeStyle(p.pageIndex)}" title="右クリックで移動先ページを選択、またはゴミ箱へ移動">P${displayPageNumber(p.pageIndex) || "?"}</span>
       <button type="button" data-del="${p.id}" title="ゴミ箱へ移動">×</button>
     `;
+    row.querySelector("img").addEventListener("dblclick", (e) => {
+      e.stopPropagation();
+      openPhotoLightbox(p);
+    });
     if (!state.calibrating) {
       row.addEventListener("click", (e) => {
         if (e.target.closest("button, input")) return;
@@ -1272,12 +1405,14 @@ function onPhotoRowClick(e, photo, activePhotos) {
 // ---------- ゴミ箱 ----------
 function trashPhoto(photo) {
   if (!photo) return;
+  pushUndoSnapshot();
   photo.trashed = true;
   renderPhotoList();
   buildPageList();
   renderPins();
 }
 function restorePhoto(photo) {
+  pushUndoSnapshot();
   photo.trashed = false;
   renderPhotoList();
   buildPageList();
@@ -1500,13 +1635,49 @@ function renderPins() {
   // 図面本来の座標系)を基準にするため、_screenPos/_screenDirは回転前の値のまま保持する。
   pins.forEach((pin) => { pin.photo._screenPos = pin.pos; pin.photo._screenDir = pin.dir; });
 
+  // 同じ地点で撮った複数枚のピンが重なっていても、サムネイルだけは少しずつ斜めにずらして
+  // 配置し、複数あることが一目で分かるようにする(ピン自体は重なったままでよい)。
+  const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
+  const staggerMap = computeAutoThumbStagger(pins.map((p) => ({ id: p.photo.id, pos: p.pos })), zoomFactor);
+
   // 実際の描画位置だけは、pinCanvasの逆回転(applyCanvasTransform)と打ち消し合うよう
   // 回転角ぶん回転させる。これにより位置は図面と一緒に動くが、pinCanvas自体は
   // まっすぐなままなので、写真・ピン・矢印の向きはまっすぐ表示される。
   for (const pin of pins) {
-    drawPin(ctx, { ...pin, pos: rotateForView(pin.pos, canvas, viewRotation) });
+    drawPin(ctx, { ...pin, pos: rotateForView(pin.pos, canvas, viewRotation), autoThumbOffset: staggerMap.get(pin.photo.id) });
   }
   drawCalibOverlay(ctx);
+}
+// 同じ地点(見た目上、この距離以内)で撮った複数枚が重ならないよう、サムネイルの位置だけ
+// 少しずつ斜めにずらす。itemsは[{id, pos}]。idの昇順(=写真の追加順)で安定した並びにする。
+const AUTO_THUMB_STAGGER_STEP = 14; // px(表示倍率100%のとき)
+function computeAutoThumbStagger(items, zoomFactor) {
+  const zf = zoomFactor || 1;
+  const threshold = 20 * zf;
+  const sorted = [...items].sort((a, b) => a.id - b.id);
+  const used = new Set();
+  const result = new Map();
+  for (const item of sorted) {
+    if (used.has(item.id)) continue;
+    const cluster = [item];
+    used.add(item.id);
+    for (const other of sorted) {
+      if (used.has(other.id)) continue;
+      if (Math.hypot(other.pos.x - item.pos.x, other.pos.y - item.pos.y) <= threshold) {
+        cluster.push(other);
+        used.add(other.id);
+      }
+    }
+    const step = AUTO_THUMB_STAGGER_STEP * zf;
+    cluster.forEach((p, i) => result.set(p.id, { x: i * step, y: i * step }));
+  }
+  return result;
+}
+// 自動ずらし(auto)と手動での微調整(manual、thumbOffset)を足し合わせる
+function combinedThumbOffset(auto, manual) {
+  const a = auto || { x: 0, y: 0 };
+  const m = manual || { x: 0, y: 0 };
+  return { x: a.x + m.x, y: a.y + m.y };
 }
 
 // 写真レイヤーの範囲を示すガイド枠。四辺すべて赤い実線で表示する。
@@ -1549,6 +1720,9 @@ function drawLayerBoundsOverlay(ctx, photosOnPage, t, canvas, viewRotation) {
   ctx.restore();
 }
 
+// 描画順(下から上): 矢印 → ピン(円+番号) → 引き出し線 → サムネイル。
+// サムネイルを一番上にすることで、同じ地点で複数のピンが重なっていても
+// 写真は隠れずに見える(ピン同士が重なるのは問題ないため一番下でよい)。
 function drawPin(ctx, pin) {
   const { pos, photo, index, dir } = pin;
   // PDFの表示倍率を変えても図面に対する見た目の大きさ(サムネ・ピン・矢印・引き出し線)が
@@ -1557,7 +1731,9 @@ function drawPin(ctx, pin) {
   const r = effPinSize(photo, zoomFactor);
   const { w: thumbW, h: thumbH } = thumbBoxSize(photo, null, zoomFactor);
   const leaderLen = effLeaderLength(photo, zoomFactor);
-  const { x: thumbCx, y: thumbCy } = thumbCenter(pos, r, thumbW, thumbH, leaderLen, photo.thumbOffset);
+  // 自動ずらし(同じ地点の重なり回避)＋手動での微調整を合わせたオフセット
+  const offset = combinedThumbOffset(pin.autoThumbOffset, photo.thumbOffset);
+  const { x: thumbCx, y: thumbCy } = thumbCenter(pos, r, thumbW, thumbH, leaderLen, offset);
 
   // 撮影方向の矢印
   const arrowCol = effArrowColor(photo);
@@ -1578,6 +1754,24 @@ function drawPin(ctx, pin) {
   ctx.lineTo(arrow.wing2.x, arrow.wing2.y);
   ctx.closePath();
   ctx.fill();
+  ctx.restore();
+
+  // ピン（円+番号）
+  const pinColor = photo.pinColor || DEFAULT_PIN_COLOR;
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = pinColor;
+  ctx.fill();
+  ctx.lineWidth = 1.5;
+  ctx.strokeStyle = "#fff";
+  ctx.stroke();
+  ctx.fillStyle = contrastTextColor(pinColor);
+  const label = photo.numberLabel != null ? photo.numberLabel : String(index + 1);
+  ctx.font = `bold ${Math.max(9, r)}px sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, pos.x, pos.y + 0.5);
   ctx.restore();
 
   // 引き出し線
@@ -1603,24 +1797,6 @@ function drawPin(ctx, pin) {
     ctx.drawImage(img, thumbCx - thumbW / 2 + inset, thumbCy - thumbH / 2 + inset, thumbW - inset * 2, thumbH - inset * 2);
   }
   ctx.strokeRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbW, thumbH);
-  ctx.restore();
-
-  // ピン（円+番号）
-  const pinColor = photo.pinColor || DEFAULT_PIN_COLOR;
-  ctx.save();
-  ctx.beginPath();
-  ctx.arc(pos.x, pos.y, r, 0, Math.PI * 2);
-  ctx.fillStyle = pinColor;
-  ctx.fill();
-  ctx.lineWidth = 1.5;
-  ctx.strokeStyle = "#fff";
-  ctx.stroke();
-  ctx.fillStyle = contrastTextColor(pinColor);
-  const label = photo.numberLabel != null ? photo.numberLabel : String(index + 1);
-  ctx.font = `bold ${Math.max(9, r)}px sans-serif`;
-  ctx.textAlign = "center";
-  ctx.textBaseline = "middle";
-  ctx.fillText(label, pos.x, pos.y + 0.5);
   ctx.restore();
 }
 
@@ -1692,11 +1868,13 @@ function onCanvasMouseDown(e) {
   const pos = canvasPosFromEvent(e);
   const arrowHit = hitTestArrowTip(pos);
   if (arrowHit) {
+    pushUndoSnapshot();
     state.draggingArrow = arrowHit.id;
     return;
   }
   const hit = hitTestPin(pos);
   if (hit) {
+    pushUndoSnapshot();
     state.draggingPin = hit.id;
     state.dragLast = pos;
     return;
@@ -1705,6 +1883,7 @@ function onCanvasMouseDown(e) {
   // 写真だけをつまんでずらせるようにする(ピン自体の位置には影響しない)。
   const thumbHit = hitTestThumbnail(pos);
   if (thumbHit) {
+    pushUndoSnapshot();
     state.draggingThumb = thumbHit.id;
     state.dragLast = pos;
     return;
@@ -1713,12 +1892,14 @@ function onCanvasMouseDown(e) {
   // 角=等アスペクトで拡縮(反対の角が基点)、上下の辺=縦だけ、左右の辺=横だけ拡縮(反対の辺が基点)。
   const handle = hitTestLayerHandle(pos);
   if (handle) {
+    pushUndoSnapshot();
     state.draggingResize = handle;
     return;
   }
   // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
   // それ以外でも写真レイヤーの枠(基準線)を直接つまんでドラッグすれば移動できるようにする。
   if (state.layerPanMode || hitTestLayerBounds(pos)) {
+    pushUndoSnapshot();
     state.draggingLayer = true;
     state.dragLast = pos;
   }
@@ -1828,6 +2009,9 @@ function hitTestPin(pos) {
 function hitTestThumbnail(pos) {
   const photosOnPage = getPagePhotos(state.currentPage);
   const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
+  // 描画時(drawPin)と同じ自動ずらしを再現しないと、見た目の位置とクリック判定がズレるため
+  const staggerMap = computeAutoThumbStagger(
+    photosOnPage.filter((p) => p._screenPos).map((p) => ({ id: p.id, pos: p._screenPos })), zoomFactor);
   for (let i = photosOnPage.length - 1; i >= 0; i--) {
     const p = photosOnPage[i];
     const sp = p._screenPos;
@@ -1835,7 +2019,8 @@ function hitTestThumbnail(pos) {
     const r = effPinSize(p, zoomFactor);
     const { w: thumbW, h: thumbH } = thumbBoxSize(p, null, zoomFactor);
     const leaderLen = effLeaderLength(p, zoomFactor);
-    const { x: thumbCx, y: thumbCy } = thumbCenter(sp, r, thumbW, thumbH, leaderLen, p.thumbOffset);
+    const offset = combinedThumbOffset(staggerMap.get(p.id), p.thumbOffset);
+    const { x: thumbCx, y: thumbCy } = thumbCenter(sp, r, thumbW, thumbH, leaderLen, offset);
     if (pos.x >= thumbCx - thumbW / 2 && pos.x <= thumbCx + thumbW / 2
       && pos.y >= thumbCy - thumbH / 2 && pos.y <= thumbCy + thumbH / 2) {
       return p;
@@ -1938,15 +2123,47 @@ function onCanvasMouseUp() {
 function onCanvasDblClick(e) {
   if (state.calibrating) return;
   const pos = canvasPosFromEvent(e);
-  const hit = hitTestPin(pos);
-  if (!hit) return;
-  promptEditPinNumber(hit);
+  const pinHit = hitTestPin(pos);
+  if (pinHit) { promptEditPinNumber(pinHit); return; }
+  const thumbHit = hitTestThumbnail(pos);
+  if (thumbHit) openPhotoLightbox(thumbHit);
+}
+
+// ---------- サムネイルのダブルクリックで開く拡大表示 ----------
+let lightboxObjectUrl = null;
+function openPhotoLightbox(photo) {
+  const overlay = el("photoLightbox");
+  const img = el("lightboxImg");
+  if (lightboxObjectUrl) { URL.revokeObjectURL(lightboxObjectUrl); lightboxObjectUrl = null; }
+  // photo.fileが原本(このセッションで取り込んだもの)ならそちらを使い、
+  // プロジェクト読込み後などで原本が無ければサムネイルにフォールバックする。
+  if (photo.file) {
+    lightboxObjectUrl = URL.createObjectURL(photo.file);
+    img.src = lightboxObjectUrl;
+  } else {
+    img.src = photo.thumbDataUrl;
+  }
+  overlay.hidden = false;
+}
+function closePhotoLightbox() {
+  const overlay = el("photoLightbox");
+  if (overlay.hidden) return;
+  overlay.hidden = true;
+  el("lightboxImg").src = "";
+  if (lightboxObjectUrl) { URL.revokeObjectURL(lightboxObjectUrl); lightboxObjectUrl = null; }
+}
+function initPhotoLightbox() {
+  const overlay = el("photoLightbox");
+  overlay.addEventListener("click", (e) => { if (e.target === overlay) closePhotoLightbox(); });
+  el("lightboxCloseBtn").addEventListener("click", closePhotoLightbox);
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape") closePhotoLightbox(); });
 }
 
 function promptEditPinNumber(photo) {
   const current = photo.numberLabel != null ? photo.numberLabel : String(getActivePhotos().indexOf(photo) + 1);
   const val = prompt("ピン番号を入力してください", current);
   if (val === null) return;
+  pushUndoSnapshot();
   const trimmed = val.trim();
   photo.numberLabel = trimmed === "" ? null : trimmed;
   renderPins();
@@ -1969,6 +2186,7 @@ function promptEditPinColor(photos) {
     if (input.parentNode) document.body.removeChild(input);
   };
   input.addEventListener("input", () => {
+    pushUndoSnapshot();
     targets.forEach((p) => { p.pinColor = input.value; });
     renderPins();
     renderPhotoList();
@@ -2098,52 +2316,62 @@ function refreshPinDetailInputs() {
 function initPinDetailPanel() {
   el("pdPinSize").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.pinSizeOverride = Number(e.target.value);
     renderPins();
   });
   el("pdLeaderWidth").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.leaderWidthOverride = Number(e.target.value);
     renderPins();
   });
   el("pdLeaderLength").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.leaderLengthOverride = Number(e.target.value);
     renderPins();
   });
   el("pdLeaderColor").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.leaderColorOverride = e.target.value;
     renderPins();
   });
   el("pdArrowWidth").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.arrowWidthOverride = Number(e.target.value);
     renderPins();
   });
   el("pdArrowLength").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.arrowLengthOverride = Number(e.target.value);
     renderPins();
   });
   el("pdArrowColor").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.arrowColorOverride = e.target.value;
     renderPins();
   });
   el("pdThumbBorderWidth").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.thumbBorderWidthOverride = Number(e.target.value);
     renderPins();
   });
   el("pdThumbBorderColor").addEventListener("input", (e) => {
     if (!pinDetailTarget) return;
+    pushUndoSnapshot();
     pinDetailTarget.thumbBorderColorOverride = e.target.value;
     renderPins();
   });
   el("pinDetailPanel").querySelectorAll("button[data-reset]").forEach((btn) => {
     btn.addEventListener("click", () => {
       if (!pinDetailTarget) return;
+      pushUndoSnapshot();
       pinDetailTarget[btn.dataset.reset] = null;
       refreshPinDetailInputs();
       renderPins();
@@ -2609,6 +2837,8 @@ async function exportCompositePdf() {
         pos: transformPoint(p, photosOnPage, t),
         dir: normalizeAngle(p.directionDeg + t.rotationDeg),
       }));
+      // プレビューと同様、同じ地点のピンが重なっていてもサムネイルだけは少しずつずらす
+      const pdfStaggerMap = computeAutoThumbStagger(pins.map((p) => ({ id: p.photo.id, pos: p.pos })), viewport.scale);
 
       for (const pin of pins) {
         // 位置(pos)の計算に足し込むサイズはviewport.scale(=そのページの表示倍率)ぶん
@@ -2622,32 +2852,15 @@ async function exportCompositePdf() {
         const screenX = pin.pos.x, screenY = pin.pos.y;
         const leaderLen = effLeaderLength(pin.photo, zf);
         const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
-        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, pinSizePx, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
+        const thumbOffset = combinedThumbOffset(pdfStaggerMap.get(pin.photo.id), pin.photo.thumbOffset);
+        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, pinSizePx, thumbW, thumbH, leaderLen, thumbOffset);
 
         const center = pdfPoint(screenX, screenY);
         const leaderEnd = pdfPoint(thumbCx - thumbW * 0.15, thumbCy + thumbH * 0.15);
         const rect = pdfRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbCx + thumbW / 2, thumbCy + thumbH / 2);
 
-        // 引き出し線
-        const [lcR, lcG, lcB] = hexToRgbTriple(effLeaderColor(pin.photo));
-        page.drawLine({
-          start: center, end: leaderEnd,
-          thickness: effLeaderWidth(pin.photo), color: rgb(lcR, lcG, lcB),
-        });
-
-        // サムネイル画像（フチ付き）
-        const jpgBytes = dataUrlToUint8Array(pin.photo.thumbDataUrl);
-        const embedded = await outDoc.embedJpg(jpgBytes);
-        const [bR, bG, bB] = hexToRgbTriple(effThumbBorderColor(pin.photo));
-        const borderWpx = effThumbBorderWidth(pin.photo);
-        page.drawRectangle({
-          x: rect.x, y: rect.y, width: rect.width, height: rect.height,
-          color: rgb(1, 1, 1), borderColor: rgb(bR, bG, bB), borderWidth: borderWpx,
-        });
-        const inset = borderWpx / 2;
-        page.drawImage(embedded, {
-          x: rect.x + inset, y: rect.y + inset, width: rect.width - inset * 2, height: rect.height - inset * 2,
-        });
+        // 描画順(下から上): 矢印 → ピン → 引き出し線 → サムネイル。同じ地点でピンが
+        // 重なっていても写真が隠れないよう、サムネイルを一番上に描く。
 
         // 撮影方向の矢印
         const pinArrowLen = effArrowLength(pin.photo, zf);
@@ -2674,6 +2887,27 @@ async function exportCompositePdf() {
         page.drawText(label, {
           x: center.x - font.widthOfTextAtSize(label, fontSize) / 2,
           y: center.y - fontSize * 0.35, size: fontSize, font, color: rgb(tr, tg, tb),
+        });
+
+        // 引き出し線
+        const [lcR, lcG, lcB] = hexToRgbTriple(effLeaderColor(pin.photo));
+        page.drawLine({
+          start: center, end: leaderEnd,
+          thickness: effLeaderWidth(pin.photo), color: rgb(lcR, lcG, lcB),
+        });
+
+        // サムネイル画像（フチ付き）
+        const jpgBytes = dataUrlToUint8Array(pin.photo.thumbDataUrl);
+        const embedded = await outDoc.embedJpg(jpgBytes);
+        const [bR, bG, bB] = hexToRgbTriple(effThumbBorderColor(pin.photo));
+        const borderWpx = effThumbBorderWidth(pin.photo);
+        page.drawRectangle({
+          x: rect.x, y: rect.y, width: rect.width, height: rect.height,
+          color: rgb(1, 1, 1), borderColor: rgb(bR, bG, bB), borderWidth: borderWpx,
+        });
+        const inset = borderWpx / 2;
+        page.drawImage(embedded, {
+          x: rect.x + inset, y: rect.y + inset, width: rect.width - inset * 2, height: rect.height - inset * 2,
         });
       }
     }
@@ -2915,11 +3149,17 @@ async function exportExcel() {
       // PDFの表示倍率を変えても図面に対する見た目の大きさが変わらないよう、
       // そのページの倍率ぶんを掛けて拡縮する(プレビューのdrawPinと同じ考え方)。
       const zf = view.zoom / 100;
+      // プレビューと同様、同じ地点のピンが重なっていてもサムネイルだけは少しずつずらす
+      const xlStaggerMap = computeAutoThumbStagger(pins.map((p) => ({ id: p.photo.id, pos: p.pos })), zf);
       for (const pin of pins) {
         const r = effPinSize(pin.photo, zf);
         const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
         const leaderLen = effLeaderLength(pin.photo, zf);
-        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, r, thumbW, thumbH, leaderLen, pin.photo.thumbOffset);
+        const thumbOffset = combinedThumbOffset(xlStaggerMap.get(pin.photo.id), pin.photo.thumbOffset);
+        const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, r, thumbW, thumbH, leaderLen, thumbOffset);
+
+        // 描画順(下から上): 矢印 → ピン → 引き出し線 → サムネイル。同じ地点でピンが
+        // 重なっていても写真が隠れないよう、サムネイルを一番上に描く。
 
         // 撮影方向の矢印
         {
@@ -2941,6 +3181,25 @@ async function exportExcel() {
             ctx.beginPath(); ctx.moveTo(tp.x, tp.y); ctx.lineTo(w1.x, w1.y); ctx.lineTo(w2.x, w2.y); ctx.closePath(); ctx.fill();
           });
           addPng(sheet, dataUrl, minX, minY, w, h);
+        }
+
+        // ピン(円+番号)
+        {
+          const pad = 3;
+          const size = (r + pad) * 2;
+          const pinColor = pin.photo.pinColor || DEFAULT_PIN_COLOR;
+          const label = pin.photo.numberLabel != null ? pin.photo.numberLabel : String(pin.index + 1);
+          const dataUrl = miniPng(size, size, (ctx) => {
+            const cx = size / 2, cy = size / 2;
+            ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
+            ctx.fillStyle = pinColor; ctx.fill();
+            ctx.lineWidth = 1.5; ctx.strokeStyle = "#fff"; ctx.stroke();
+            ctx.fillStyle = contrastTextColor(pinColor);
+            ctx.font = `bold ${Math.max(9, r)}px sans-serif`;
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText(label, cx, cy + 0.5);
+          });
+          addPng(sheet, dataUrl, pin.pos.x - size / 2, pin.pos.y - size / 2, size, size);
         }
 
         // 引き出し線
@@ -2987,25 +3246,6 @@ async function exportExcel() {
             tl: absAnchor(thumbCx - thumbW / 2 + inset, thumbCy - thumbH / 2 + inset),
             ext: { width: thumbW - inset * 2, height: thumbH - inset * 2 },
           });
-        }
-
-        // ピン(円+番号)
-        {
-          const pad = 3;
-          const size = (r + pad) * 2;
-          const pinColor = pin.photo.pinColor || DEFAULT_PIN_COLOR;
-          const label = pin.photo.numberLabel != null ? pin.photo.numberLabel : String(pin.index + 1);
-          const dataUrl = miniPng(size, size, (ctx) => {
-            const cx = size / 2, cy = size / 2;
-            ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2);
-            ctx.fillStyle = pinColor; ctx.fill();
-            ctx.lineWidth = 1.5; ctx.strokeStyle = "#fff"; ctx.stroke();
-            ctx.fillStyle = contrastTextColor(pinColor);
-            ctx.font = `bold ${Math.max(9, r)}px sans-serif`;
-            ctx.textAlign = "center"; ctx.textBaseline = "middle";
-            ctx.fillText(label, cx, cy + 0.5);
-          });
-          addPng(sheet, dataUrl, pin.pos.x - size / 2, pin.pos.y - size / 2, size, size);
         }
       }
     }
