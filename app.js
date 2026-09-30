@@ -56,7 +56,6 @@ const state = {
 
   layerPanMode: false,
   thumbsHidden: false, // trueの間、プレビュー上のサムネイル(と引き出し線)を一時的に非表示にする(ピンの位置確認用。エクスポートには影響しない)
-  selectedPhotoId: null, // プレビュー上でサムネイルをクリックして選択中の写真ID。Deleteキーでゴミ箱へ移動できる
   draggingPin: null,   // photo id being dragged
   draggingArrow: null, // photo id whose direction arrow is being dragged
   draggingThumb: null, // photo id whose thumbnail(だけ)を移動中
@@ -68,8 +67,8 @@ const state = {
   calibPoints: [],      // clicked target points [{x,y}]
   calibSelectedIds: [], // selected photo ids (max 2)
 
-  selectedPhotoIds: [], // 一覧で複数選択中の写真id（一括ページ移動・一括削除用）
-  lastClickedPhotoId: null, // shift+クリックの範囲選択の基点
+  selectedPhotoIds: [], // 一覧またはプレビュー上で複数選択中の写真id（一括ページ移動・一括削除用）
+  lastClickedPhotoId: null, // shift+クリックの範囲選択の基点(一覧・プレビュー共通)
   selectedTrashIds: [], // ゴミ箱一覧でチェックした写真id（一括で完全削除するため）
 
   undoStack: [], // Ctrl+Zで戻すための直近の状態(最大2件、古いものから)
@@ -203,11 +202,11 @@ function init() {
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
       e.preventDefault();
       undoLastAction();
-    } else if ((e.key === "Delete" || e.key === "Backspace") && state.selectedPhotoId != null) {
+    } else if ((e.key === "Delete" || e.key === "Backspace") && state.selectedPhotoIds.length) {
       e.preventDefault();
-      const photo = state.photos.find((p) => p.id === state.selectedPhotoId);
-      setSelectedPhoto(null);
-      if (photo) trashPhoto(photo);
+      const photos = state.photos.filter((p) => state.selectedPhotoIds.includes(p.id));
+      clearCanvasSelection();
+      photos.forEach((photo) => trashPhoto(photo));
     }
   });
 
@@ -1466,7 +1465,7 @@ function trashPhoto(photo) {
   if (!photo) return;
   pushUndoSnapshot();
   photo.trashed = true;
-  if (state.selectedPhotoId === photo.id) state.selectedPhotoId = null;
+  state.selectedPhotoIds = state.selectedPhotoIds.filter((id) => id !== photo.id);
   renderPhotoList();
   buildPageList();
   renderPins();
@@ -1481,7 +1480,7 @@ function restorePhoto(photo) {
 function purgePhoto(photo) {
   if (!confirm(`「${photo.name}」を完全に削除します。元に戻せません。よろしいですか？`)) return;
   state.photos = state.photos.filter((p) => p.id !== photo.id);
-  if (state.selectedPhotoId === photo.id) state.selectedPhotoId = null;
+  state.selectedPhotoIds = state.selectedPhotoIds.filter((id) => id !== photo.id);
   renderPhotoList();
   buildPageList();
   renderPins();
@@ -1557,7 +1556,7 @@ function purgeSelectedTrash() {
   const idsToRemove = new Set(targets.map((p) => p.id));
   state.photos = state.photos.filter((p) => !idsToRemove.has(p.id));
   state.selectedTrashIds = [];
-  if (idsToRemove.has(state.selectedPhotoId)) state.selectedPhotoId = null;
+  state.selectedPhotoIds = state.selectedPhotoIds.filter((id) => !idsToRemove.has(id));
   renderPhotoList();
   buildPageList();
   renderPins();
@@ -1929,8 +1928,8 @@ function drawPin(ctx, pin) {
     ctx.restore();
   }
 
-  // 選択中の写真を示す枠(クリックで選択→Deleteキーでゴミ箱へ移動できる)
-  if (photo.id === state.selectedPhotoId) {
+  // 選択中の写真を示す枠(クリックで選択。複数選択→右クリックで一括ページ移動、Deleteでゴミ箱へ移動できる)
+  if (state.selectedPhotoIds.includes(photo.id)) {
     ctx.save();
     ctx.strokeStyle = "#f59e0b";
     ctx.lineWidth = 2;
@@ -2010,10 +2009,18 @@ function onCanvasClick(e) {
   tryRunCalibration();
 }
 
-// プレビュー上でサムネイルをクリックして選択状態にする(Deleteキーでのゴミ箱移動に使う)
-function setSelectedPhoto(id) {
-  if (state.selectedPhotoId === id) return;
-  state.selectedPhotoId = id;
+// プレビュー上での写真選択を解除する(一覧側の複数選択と共通のstate.selectedPhotoIdsを使う)
+function clearCanvasSelection() {
+  if (!state.selectedPhotoIds.length) return;
+  state.selectedPhotoIds = [];
+  renderPins();
+  renderPhotoList();
+}
+// プレビュー上でサムネイルをクリックして選択する。一覧のonPhotoRowClickと同じ規則
+// (単独クリック=単独選択、Ctrl/Cmd=追加/解除、Shift=範囲選択)で、一覧側の選択と共有する。
+// これにより複数選択→右クリックで一括ページ移動・一括ゴミ箱移動ができる。
+function updateCanvasSelection(e, photo) {
+  onPhotoRowClick(e, photo, getActivePhotos());
   renderPins();
 }
 function onCanvasMouseDown(e) {
@@ -2023,7 +2030,7 @@ function onCanvasMouseDown(e) {
   if (arrowHit) {
     pushUndoSnapshot();
     state.draggingArrow = arrowHit.id;
-    setSelectedPhoto(null);
+    clearCanvasSelection();
     return;
   }
   const hit = hitTestPin(pos);
@@ -2031,7 +2038,7 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingPin = hit.id;
     state.dragLast = pos;
-    setSelectedPhoto(null);
+    clearCanvasSelection();
     return;
   }
   // 同じ地点で撮った写真同士でサムネイルが重なる場合に、ピンとは別に
@@ -2041,7 +2048,7 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingThumb = thumbHit.id;
     state.dragLast = pos;
-    setSelectedPhoto(thumbHit.id);
+    updateCanvasSelection(e, thumbHit);
     return;
   }
   // 写真レイヤーの枠(赤い四角)の辺・角をつかんで拡縮できるようにする。
@@ -2050,7 +2057,7 @@ function onCanvasMouseDown(e) {
   if (handle) {
     pushUndoSnapshot();
     state.draggingResize = handle;
-    setSelectedPhoto(null);
+    clearCanvasSelection();
     return;
   }
   // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
@@ -2059,9 +2066,9 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingLayer = true;
     state.dragLast = pos;
-    setSelectedPhoto(null);
+    clearCanvasSelection();
   } else {
-    setSelectedPhoto(null);
+    clearCanvasSelection();
   }
 }
 // 2点p1-p2を結ぶ線分と点posとの最短距離、および線分上での位置(0=p1側の端,1=p2側の端)を返す
@@ -2375,7 +2382,17 @@ function onCanvasContextMenu(e) {
   if (state.calibrating) return;
   const pos = canvasPosFromEvent(e);
   const hit = hitTestPin(pos) || hitTestThumbnail(pos);
-  if (hit) showPageContextMenu(e.clientX, e.clientY, [hit]);
+  if (!hit) return;
+  // 右クリックした写真が複数選択の一部なら選択全体に、そうでなければその1枚だけに対して操作する
+  // (一覧の右クリックメニューと同じ挙動)。
+  if (!state.selectedPhotoIds.includes(hit.id)) {
+    state.selectedPhotoIds = [hit.id];
+    state.lastClickedPhotoId = hit.id;
+    renderPins();
+    renderPhotoList();
+  }
+  const targets = state.photos.filter((p) => state.selectedPhotoIds.includes(p.id));
+  showPageContextMenu(e.clientX, e.clientY, targets);
 }
 
 // ---------- 右クリックメニュー（ページ移動・複数選択時は一括操作） ----------
@@ -2393,6 +2410,7 @@ function showPageContextMenu(clientX, clientY, photos) {
     item.textContent = `${countLabel}ページ ${i + 1} へ移動` + (allOnThisPage ? "（現在のページ）" : "");
     if (!allOnThisPage) {
       item.addEventListener("click", () => {
+        pushUndoSnapshot();
         photos.forEach((p) => { p.pageIndex = pageIndex; });
         hideContextMenu();
         renderPhotoList();
@@ -2472,6 +2490,7 @@ function showPageContextMenu(clientX, clientY, photos) {
   delItem.className = "ctxItem ctxDanger";
   delItem.textContent = `🗑 ${countLabel}ゴミ箱へ移動`;
   delItem.addEventListener("click", () => {
+    pushUndoSnapshot();
     photos.forEach((p) => { p.trashed = true; });
     state.selectedPhotoIds = [];
     hideContextMenu();
