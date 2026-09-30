@@ -71,6 +71,13 @@ const state = {
   lastClickedPhotoId: null, // shift+クリックの範囲選択の基点(一覧・プレビュー共通)
   selectedTrashIds: [], // ゴミ箱一覧でチェックした写真id（一括で完全削除するため）
 
+  // ---------- セル着色(格子状のCAD図面で、数えた升目に一時的な印を付ける機能) ----------
+  cellColorMode: false, // trueの間、キャンバスクリックでクリックした升目の色をON/OFFする
+  cellHighlights: new Map(), // srcIndex -> Map(cellKey -> {x0,y0,x1,y1}) 着色中のセル(PDF座標系・左下原点)
+  pageGridLines: new Map(),  // srcIndex -> {horiz:[...], vert:[...]} ページ解析結果のキャッシュ
+  cellHighlightColor: "#ffc107", // セル着色の色(プレビュー・PDF出力共通)
+  cellHighlightOpacity: 45, // セル着色の不透明度(%)。プレビュー・PDF出力・Excel出力共通
+
   undoStack: [], // Ctrl+Zで戻すための直近の状態(最大2件、古いものから)
 
   currentProjectDirHandle: null, // 直前に読込み/保存したプロジェクトフォルダ(FileSystemDirectoryHandle)。「保存(上書)」用
@@ -108,6 +115,7 @@ function cloneStateForUndo() {
     pages: state.pages.map((pg) => ({ ...pg })),
     dayCompareRows: state.dayCompareRows.map((r) => ({ ...r, roundCandidates: r.roundCandidates.map((ids) => [...ids]) })),
     dayCompareRoundLabels: [...state.dayCompareRoundLabels],
+    cellHighlights: new Map([...state.cellHighlights].map(([k, pageMap]) => [k, new Map(pageMap)])),
     nextPhotoId: state.nextPhotoId,
     currentPage: state.currentPage,
     thumbSize: state.thumbSize,
@@ -120,6 +128,8 @@ function cloneStateForUndo() {
     arrowColor: state.arrowColor,
     thumbBorderWidth: state.thumbBorderWidth,
     thumbBorderColor: state.thumbBorderColor,
+    cellHighlightColor: state.cellHighlightColor,
+    cellHighlightOpacity: state.cellHighlightOpacity,
   };
 }
 // 変更を加える直前に呼び、そのときの状態を控えておく。短時間(ドラッグ中の連続呼び出しや
@@ -141,6 +151,7 @@ function undoLastAction() {
   state.pages = snap.pages;
   state.dayCompareRows = snap.dayCompareRows;
   state.dayCompareRoundLabels = snap.dayCompareRoundLabels;
+  state.cellHighlights = snap.cellHighlights;
   state.nextPhotoId = snap.nextPhotoId;
   state.thumbSize = snap.thumbSize;
   state.pinSize = snap.pinSize;
@@ -152,6 +163,8 @@ function undoLastAction() {
   state.arrowColor = snap.arrowColor;
   state.thumbBorderWidth = snap.thumbBorderWidth;
   state.thumbBorderColor = snap.thumbBorderColor;
+  state.cellHighlightColor = snap.cellHighlightColor;
+  state.cellHighlightOpacity = snap.cellHighlightOpacity;
   lastUndoPushAt = 0; // 直後の操作をすぐ別枠として記録できるようにする
 
   syncGlobalSettingInputs();
@@ -187,6 +200,9 @@ function syncGlobalSettingInputs() {
   el("arrowLength").value = state.arrowLength;
   el("arrowLengthVal").value = state.arrowLength;
   el("arrowColor").value = state.arrowColor;
+  el("cellHighlightColor").value = state.cellHighlightColor;
+  el("cellHighlightOpacity").value = state.cellHighlightOpacity;
+  el("cellHighlightOpacityVal").value = state.cellHighlightOpacity;
 }
 
 // ---------- 初期化 ----------
@@ -344,11 +360,38 @@ function init() {
     el("toggleThumbsBtn").textContent = state.thumbsHidden ? "🖼 サムネを表示" : "🖼 サムネを隠す";
     renderPins();
   });
+  el("cellHighlightColor").addEventListener("input", (e) => {
+    pushUndoSnapshot();
+    state.cellHighlightColor = e.target.value;
+    renderPins();
+  });
+  el("cellColorPalette").querySelectorAll(".colorSwatch").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const colorInput = el("cellHighlightColor");
+      colorInput.value = btn.getAttribute("data-color");
+      colorInput.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  });
+  wireRangeWithNumber("cellHighlightOpacity", "cellHighlightOpacityVal", (val) => {
+    state.cellHighlightOpacity = val;
+    renderPins();
+  });
 
+  el("cellColorModeBtn").addEventListener("click", () => {
+    state.cellColorMode = !state.cellColorMode;
+    el("cellColorModeBtn").classList.toggle("active", state.cellColorMode);
+    if (state.cellColorMode) {
+      state.layerPanMode = false; el("layerPanBtn").classList.remove("active");
+      state.calibrating = false; updateCalibUi();
+    }
+  });
   el("layerPanBtn").addEventListener("click", () => {
     state.layerPanMode = !state.layerPanMode;
     el("layerPanBtn").classList.toggle("active", state.layerPanMode);
-    if (state.layerPanMode) { state.calibrating = false; updateCalibUi(); }
+    if (state.layerPanMode) {
+      state.calibrating = false; updateCalibUi();
+      state.cellColorMode = false; el("cellColorModeBtn").classList.remove("active");
+    }
   });
   el("resetLayerBtn").addEventListener("click", () => {
     state.pageTransform.set(state.currentPage, defaultTransform());
@@ -359,7 +402,10 @@ function init() {
     state.calibrating = !state.calibrating;
     state.calibPoints = [];
     state.calibSelectedIds = [];
-    if (state.calibrating) { state.layerPanMode = false; el("layerPanBtn").classList.remove("active"); }
+    if (state.calibrating) {
+      state.layerPanMode = false; el("layerPanBtn").classList.remove("active");
+      state.cellColorMode = false; el("cellColorModeBtn").classList.remove("active");
+    }
     updateCalibUi();
     renderPhotoList();
   });
@@ -598,6 +644,7 @@ async function onPdfFiles(files) {
 
   const { PDFDocument } = PDFLib;
   const isFirstImport = !state.pdfDoc;
+  state.pageGridLines = new Map(); // PDFの内容が変わるので、格子線の解析キャッシュは作り直す
   const mergedDoc = state.pdfBytesForExport
     ? await PDFDocument.load(state.pdfBytesForExport)
     : await PDFDocument.create();
@@ -1702,12 +1749,175 @@ function angleFromVector(cx, cy, px, py) {
   return normalizeAngle(Math.atan2(px - cx, cy - py) * 180 / Math.PI);
 }
 
+// ---------- セル着色(CAD図面の格子の升目を数えるための一時的な印) ----------
+// CAD図面をPDF化したものは、格子線が実線(stroke)ではなく「細い塗りつぶし矩形」として
+// 描かれていることが多い。ページの描画命令(operator list)を解析してそれらの矩形を集め、
+// 横線・縦線のリストとして再構築する。結果はPDFページ座標系(左下原点)で返す。
+async function extractGridLines(pdfPage) {
+  const opList = await pdfPage.getOperatorList();
+  const OPS = pdfjsLib.OPS;
+  const { fnArray, argsArray } = opList;
+  const horiz = [], vert = [];
+  const ctmStack = [];
+  let ctm = [1, 0, 0, 1, 0, 0];
+  let pendingSubpaths = null;
+
+  const COORD_COUNTS = {};
+  COORD_COUNTS[OPS.moveTo] = 2; COORD_COUNTS[OPS.lineTo] = 2;
+  COORD_COUNTS[OPS.curveTo] = 6; COORD_COUNTS[OPS.curveTo2] = 4; COORD_COUNTS[OPS.curveTo3] = 4;
+  COORD_COUNTS[OPS.closePath] = 0; COORD_COUNTS[OPS.rectangle] = 4;
+
+  const mulMatrix = (m, c) => [
+    m[0] * c[0] + m[1] * c[2], m[0] * c[1] + m[1] * c[3],
+    m[2] * c[0] + m[3] * c[2], m[2] * c[1] + m[3] * c[3],
+    m[4] * c[0] + m[5] * c[2] + c[4], m[4] * c[1] + m[5] * c[3] + c[5],
+  ];
+  const applyMatrix = (c, x, y) => [c[0] * x + c[2] * y + c[4], c[1] * x + c[3] * y + c[5]];
+
+  // 直前に組み立てたパス(pendingSubpaths)のうち、4点で細長い矩形になっているものだけを
+  // 「格子線」として採用する(文字・記号などの塗りつぶしは幅も高さもある程度あるため除外される)。
+  function commitPendingAsGrid() {
+    if (!pendingSubpaths) return;
+    const THIN = 2.0; // pt。これ以下の太さなら「線」とみなす
+    for (const pts of pendingSubpaths) {
+      if (pts.length !== 4) continue;
+      const xs = pts.map((p) => p[0]), ys = pts.map((p) => p[1]);
+      const x0 = Math.min(...xs), x1 = Math.max(...xs);
+      const y0 = Math.min(...ys), y1 = Math.max(...ys);
+      const w = x1 - x0, h = y1 - y0;
+      if (w <= 0 || h <= 0) continue;
+      if (h <= THIN && w > h) horiz.push({ x0, x1, y: (y0 + y1) / 2 });
+      else if (w <= THIN && h > w) vert.push({ y0, y1, x: (x0 + x1) / 2 });
+    }
+    pendingSubpaths = null;
+  }
+
+  for (let i = 0; i < fnArray.length; i++) {
+    const fn = fnArray[i], args = argsArray[i];
+    if (fn === OPS.save) {
+      ctmStack.push(ctm);
+    } else if (fn === OPS.restore) {
+      ctm = ctmStack.pop() || ctm;
+    } else if (fn === OPS.transform) {
+      ctm = mulMatrix(args, ctm);
+    } else if (fn === OPS.constructPath) {
+      const subOps = args[0], coords = args[1];
+      const subpaths = [];
+      let current = null;
+      let ci = 0;
+      for (const op of subOps) {
+        if (op === OPS.moveTo) {
+          if (current) subpaths.push(current);
+          current = [applyMatrix(ctm, coords[ci], coords[ci + 1])];
+        } else if (op === OPS.lineTo) {
+          if (current) current.push(applyMatrix(ctm, coords[ci], coords[ci + 1]));
+        } else if (op === OPS.rectangle) {
+          const x = coords[ci], y = coords[ci + 1], w = coords[ci + 2], h = coords[ci + 3];
+          if (current) { subpaths.push(current); current = null; }
+          subpaths.push([applyMatrix(ctm, x, y), applyMatrix(ctm, x + w, y), applyMatrix(ctm, x + w, y + h), applyMatrix(ctm, x, y + h)]);
+        } else if (op !== OPS.closePath) {
+          current = null; // curveTo等: 格子線候補としては諦める(座標だけ正しく読み飛ばす)
+        }
+        ci += (COORD_COUNTS[op] || 0);
+      }
+      if (current) subpaths.push(current);
+      pendingSubpaths = subpaths;
+    } else if (fn === OPS.fill || fn === OPS.eoFill || fn === OPS.fillStroke || fn === OPS.eoFillStroke) {
+      commitPendingAsGrid();
+    }
+  }
+  return { horiz, vert };
+}
+
+// ページ番号(srcIndex)ごとに格子線の解析結果をキャッシュしつつ取得する
+async function getGridLinesForPage(srcIndex) {
+  if (!state.pdfDoc || srcIndex == null || srcIndex < 0) return null;
+  if (state.pageGridLines.has(srcIndex)) return state.pageGridLines.get(srcIndex);
+  const page = await state.pdfDoc.getPage(srcIndex + 1);
+  const lines = await extractGridLines(page);
+  state.pageGridLines.set(srcIndex, lines);
+  return lines;
+}
+
+// 格子線のリストから、点(px,py)を囲む升目(セル)の矩形を求める。
+// 上下左右それぞれ最も近い(点を通る範囲を持つ)線を探し、その4本で囲まれた範囲を返す。
+// 見つからなければnull(格子の外、または格子が無いページ)。
+function findCellAtPoint(gridLines, px, py, tol) {
+  tol = tol != null ? tol : 0.05;
+  let below = null, above = null;
+  for (const h of gridLines.horiz) {
+    if (px >= h.x0 - tol && px <= h.x1 + tol) {
+      if (h.y <= py + tol && (below === null || h.y > below.y)) below = h;
+      if (h.y >= py - tol && (above === null || h.y < above.y)) above = h;
+    }
+  }
+  let left = null, right = null;
+  for (const v of gridLines.vert) {
+    if (py >= v.y0 - tol && py <= v.y1 + tol) {
+      if (v.x <= px + tol && (left === null || v.x > left.x)) left = v;
+      if (v.x >= px - tol && (right === null || v.x < right.x)) right = v;
+    }
+  }
+  if (!below || !above || !left || !right || below === above || left === right) return null;
+  return { x0: left.x, x1: right.x, y0: below.y, y1: above.y };
+}
+
+function cellKey(cell) {
+  return [cell.x0, cell.y0, cell.x1, cell.y1].map((n) => n.toFixed(2)).join(",");
+}
+
+// クリック位置の升目の着色をON/OFFする(数えている最中の一時的な目印)
+async function toggleCellAtEvent(e) {
+  if (!state.pdfDoc || !state.pageViewport || state.currentPage === "compare" || state.currentPage < 0) return;
+  const pos = canvasPosFromEvent(e);
+  const [pdfX, pdfY] = state.pageViewport.convertToPdfPoint(pos.x, pos.y);
+  const gridLines = await getGridLinesForPage(state.currentPage);
+  if (!gridLines) return;
+  const cell = findCellAtPoint(gridLines, pdfX, pdfY);
+  if (!cell) return;
+  pushUndoSnapshot();
+  let pageMap = state.cellHighlights.get(state.currentPage);
+  if (!pageMap) { pageMap = new Map(); state.cellHighlights.set(state.currentPage, pageMap); }
+  const key = cellKey(cell);
+  // 色・不透明度はセルごとに、着色した時点で選んでいた値を固定で持たせる。あとで設定を
+  // 変えても、既に着色済みのセルまでさかのぼって変わってしまわないようにするため。
+  if (pageMap.has(key)) pageMap.delete(key);
+  else pageMap.set(key, { ...cell, color: state.cellHighlightColor, opacity: state.cellHighlightOpacity });
+  renderPins();
+}
+
+// 現在のページの着色中セルを、PDF図面の上に半透明で塗る(ピンより下に描画する)
+function drawCellHighlights(ctx, canvas) {
+  const pageMap = state.cellHighlights.get(state.currentPage);
+  if (!pageMap || !pageMap.size || !state.pageViewport) return;
+  const v = getPageView(state.currentPage);
+  ctx.save();
+  for (const cell of pageMap.values()) {
+    const [cr, cg, cb] = hexToRgbTriple(cell.color || state.cellHighlightColor);
+    const cellOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
+    ctx.fillStyle = `rgba(${Math.round(cr * 255)}, ${Math.round(cg * 255)}, ${Math.round(cb * 255)}, ${cellOpacity})`;
+    const corners = [
+      [cell.x0, cell.y0], [cell.x1, cell.y0], [cell.x1, cell.y1], [cell.x0, cell.y1],
+    ].map(([px, py]) => {
+      const [vx, vy] = state.pageViewport.convertToViewportPoint(px, py);
+      return rotateForView({ x: vx, y: vy }, canvas, v.rotation || 0);
+    });
+    ctx.beginPath();
+    ctx.moveTo(corners[0].x, corners[0].y);
+    for (let i = 1; i < corners.length; i++) ctx.lineTo(corners[i].x, corners[i].y);
+    ctx.closePath();
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 // ---------- ピン描画 ----------
 function renderPins() {
   const canvas = el("pinCanvas");
   if (!canvas.width) return;
   const ctx = canvas.getContext("2d");
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+  drawCellHighlights(ctx, canvas);
   const photosOnPage = getPagePhotos(state.currentPage);
   if (!photosOnPage.length) { drawCalibOverlay(ctx); return; }
   const t = getPageTransform(state.currentPage);
@@ -2002,6 +2212,7 @@ function canvasPosFromEvent(e) {
 }
 
 function onCanvasClick(e) {
+  if (state.cellColorMode) { toggleCellAtEvent(e); return; }
   if (!state.calibrating) return;
   if (state.calibPoints.length >= 2) state.calibPoints = [];
   state.calibPoints.push(canvasPosFromEvent(e));
@@ -2024,7 +2235,7 @@ function updateCanvasSelection(e, photo) {
   renderPins();
 }
 function onCanvasMouseDown(e) {
-  if (state.calibrating) return;
+  if (state.calibrating || state.cellColorMode) return;
   const pos = canvasPosFromEvent(e);
   const arrowHit = hitTestArrowTip(pos);
   if (arrowHit) {
@@ -2734,6 +2945,11 @@ function buildProjectManifest() {
     dayCompareGapHours: state.dayCompareGapHours,
     dayCompareRows: state.dayCompareRows,
     dayCompareRoundLabels: state.dayCompareRoundLabels,
+    cellHighlights: Object.fromEntries(
+      [...state.cellHighlights.entries()].map(([srcIndex, pageMap]) => [srcIndex, [...pageMap.values()]])
+    ),
+    cellHighlightColor: state.cellHighlightColor,
+    cellHighlightOpacity: state.cellHighlightOpacity,
     thumbSize: state.thumbSize,
     pinSize: state.pinSize,
     leaderLineWidth: state.leaderLineWidth,
@@ -2909,6 +3125,17 @@ async function restoreFromManifest(manifest, projectDir) {
   const loadingTask = pdfjsLib.getDocument({ data: pdfBytes.slice(0) });
   state.pdfDoc = await loadingTask.promise;
   state.numPages = state.pdfDoc.numPages;
+  state.pageGridLines = new Map(); // PDFの内容が変わるので、格子線の解析キャッシュは作り直す
+
+  // セル着色(格子の升目への一時的な色付け)。旧形式のproject.jsonには無いため、その場合は空にする。
+  state.cellHighlights = new Map();
+  if (manifest.cellHighlights) {
+    for (const [srcIndex, cells] of Object.entries(manifest.cellHighlights)) {
+      const pageMap = new Map();
+      for (const cell of cells) pageMap.set(cellKey(cell), cell);
+      state.cellHighlights.set(Number(srcIndex), pageMap);
+    }
+  }
 
   // pages/pdfSourcesが無い(この機能追加前に保存された)project.jsonでも読み込めるよう、
   // その場合はゴミ箱・並び替えなしの初期状態として組み立て直す。
@@ -2941,6 +3168,11 @@ async function restoreFromManifest(manifest, projectDir) {
   state.arrowColor = manifest.arrowColor || state.arrowColor;
   state.thumbBorderWidth = manifest.thumbBorderWidth != null ? manifest.thumbBorderWidth : state.thumbBorderWidth;
   state.thumbBorderColor = manifest.thumbBorderColor || state.thumbBorderColor;
+  state.cellHighlightColor = manifest.cellHighlightColor || state.cellHighlightColor;
+  state.cellHighlightOpacity = manifest.cellHighlightOpacity != null ? manifest.cellHighlightOpacity : state.cellHighlightOpacity;
+  el("cellHighlightColor").value = state.cellHighlightColor;
+  el("cellHighlightOpacity").value = state.cellHighlightOpacity;
+  el("cellHighlightOpacityVal").value = state.cellHighlightOpacity;
   el("thumbSize").value = state.thumbSize;
   el("thumbSizeVal").value = state.thumbSize;
   el("thumbBorderWidth").value = state.thumbBorderWidth;
@@ -3088,6 +3320,23 @@ async function exportCompositePdf() {
     const { PDFDocument, rgb, StandardFonts } = PDFLib;
     const outDoc = await PDFDocument.load(state.pdfBytesForExport);
     const font = await outDoc.embedFont(StandardFonts.HelveticaBold);
+
+    // セル着色(格子の升目への一時的な色付け)。写真が1枚も無いページにも塗られうるため、
+    // 写真の有無で処理をスキップする下のループとは別に、常にすべての表示中ページを処理する。
+    for (const pg of visiblePages()) {
+      const pageMap = state.cellHighlights.get(pg.srcIndex);
+      if (!pageMap || !pageMap.size) continue;
+      const page = outDoc.getPage(pg.srcIndex);
+      for (const cell of pageMap.values()) {
+        const [chR, chG, chB] = hexToRgbTriple(cell.color || state.cellHighlightColor);
+        const chOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
+        page.drawRectangle({
+          x: cell.x0, y: cell.y0,
+          width: cell.x1 - cell.x0, height: cell.y1 - cell.y0,
+          color: rgb(chR, chG, chB), opacity: chOpacity,
+        });
+      }
+    }
 
     const activePhotos = getActivePhotos();
     for (const pg of visiblePages()) {
@@ -3397,7 +3646,9 @@ async function exportExcel() {
     for (const [i, pg] of visiblePages().entries()) {
       const pageIndex = pg.srcIndex;
       const photosOnPage = getPagePhotos(pageIndex);
-      if (!photosOnPage.length) continue;
+      const xlCellMap = state.cellHighlights.get(pageIndex);
+      // 写真が1枚も無いページでも、セル着色だけされている場合はシートを出力する
+      if (!photosOnPage.length && !(xlCellMap && xlCellMap.size)) continue;
 
       const view = getPageView(pageIndex);
       const srcPage = await state.pdfDoc.getPage(pageIndex + 1);
@@ -3413,7 +3664,23 @@ async function exportExcel() {
       const bgCanvas = document.createElement("canvas");
       bgCanvas.width = Math.ceil(viewport.width);
       bgCanvas.height = Math.ceil(viewport.height);
-      await srcPage.render({ canvasContext: bgCanvas.getContext("2d"), viewport }).promise;
+      const bgCtx = bgCanvas.getContext("2d");
+      await srcPage.render({ canvasContext: bgCtx, viewport }).promise;
+      // セル着色(格子の升目への一時的な色付け)。図面画像にそのまま焼き込む。
+      if (xlCellMap && xlCellMap.size) {
+        bgCtx.save();
+        for (const cell of xlCellMap.values()) {
+          const [cR, cG, cB] = hexToRgbTriple(cell.color || state.cellHighlightColor);
+          const cellOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
+          bgCtx.fillStyle = `rgba(${Math.round(cR * 255)}, ${Math.round(cG * 255)}, ${Math.round(cB * 255)}, ${cellOpacity})`;
+          const p0 = viewport.convertToViewportPoint(cell.x0, cell.y0);
+          const p1 = viewport.convertToViewportPoint(cell.x1, cell.y1);
+          const x0 = Math.min(p0[0], p1[0]), x1 = Math.max(p0[0], p1[0]);
+          const y0 = Math.min(p0[1], p1[1]), y1 = Math.max(p0[1], p1[1]);
+          bgCtx.fillRect(x0, y0, x1 - x0, y1 - y0);
+        }
+        bgCtx.restore();
+      }
       addPng(sheet, bgCanvas.toDataURL("image/png"), 0, 0, viewport.width, viewport.height);
 
       const t = getPageTransform(pageIndex);

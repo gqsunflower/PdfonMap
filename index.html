@@ -19,6 +19,23 @@
     <section id="previewPane">
       <div id="previewToolbar" class="toolgroup">
         <button type="button" id="toggleThumbsBtn" title="写真が多いときに、サムネイルを一時的に隠してピンの配置を確認できます">🖼 サムネを隠す</button>
+        <button type="button" id="cellColorModeBtn" title="格子状の図面で、クリックした升目に一時的な色を付けて数えるのに使えます。もう一度クリックすると色が消えます">🟧 セル着色モード</button>
+        <input type="color" id="cellHighlightColor" value="#ffc107" title="セルに付ける色">
+        <div id="cellColorPalette" class="colorPalette">
+          <button type="button" class="colorSwatch" data-color="#000000" title="黒" style="background:#000000;"></button>
+          <button type="button" class="colorSwatch" data-color="#f44336" title="赤" style="background:#f44336;"></button>
+          <button type="button" class="colorSwatch" data-color="#ff9800" title="オレンジ" style="background:#ff9800;"></button>
+          <button type="button" class="colorSwatch" data-color="#ffeb3b" title="黄" style="background:#ffeb3b;"></button>
+          <button type="button" class="colorSwatch" data-color="#cddc39" title="黄緑" style="background:#cddc39;"></button>
+          <button type="button" class="colorSwatch" data-color="#4caf50" title="緑" style="background:#4caf50;"></button>
+          <button type="button" class="colorSwatch" data-color="#00bcd4" title="水色" style="background:#00bcd4;"></button>
+          <button type="button" class="colorSwatch" data-color="#2196f3" title="青" style="background:#2196f3;"></button>
+          <button type="button" class="colorSwatch" data-color="#9c27b0" title="紫" style="background:#9c27b0;"></button>
+          <button type="button" class="colorSwatch" data-color="#9e9e9e" title="灰色" style="background:#9e9e9e;"></button>
+        </div>
+        <span class="opacityLabel">不透明度</span>
+        <input type="range" id="cellHighlightOpacity" min="5" max="100" step="5" value="45" title="セル着色の不透明度">
+        <input type="number" id="cellHighlightOpacityVal" class="valInput" min="5" max="100" step="5" value="45">%
       </div>
       <div id="canvasScroll">
         <div id="canvasStack">
@@ -29,7 +46,7 @@
       </div>
       <div id="compareView" class="compareView" hidden></div>
       <div id="calibHint" class="hint" hidden></div>
-      <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。同じ地点の写真が重なるときは、写真自体をドラッグするとピンの位置は変えずに写真だけずらせます。写真（サムネイル）をダブルクリックすると拡大表示できます。写真をクリックして選択し、Deleteキーでゴミ箱へ移動できます。</div>
+      <div class="hint">ピンから伸びる矢印の先端をドラッグすると撮影方向を調整できます。ピン番号をダブルクリックすると番号を変更できます。写真を右クリックすると移動先ページを選べます。同じ地点の写真が重なるときは、写真自体をドラッグするとピンの位置は変えずに写真だけずらせます。写真（サムネイル）をダブルクリックすると拡大表示できます。写真をクリックして選択し、Deleteキーでゴミ箱へ移動できます。「セル着色モード」中は、格子状の図面をクリックした升目に色を付けたり消したりできます。</div>
     </section>
 
     <div id="splitHandle" title="ドラッグして幅を調整"></div>
