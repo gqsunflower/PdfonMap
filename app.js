@@ -1694,8 +1694,14 @@ function computeAutoThumbStagger(items, zoomFactor) {
 // 手動で動かした後は自動ずらし分を足し込まず、手動値をそのまま使う。
 // (足し込む仕様のままだと、他の写真をゴミ箱に移動して同じ地点のクラスタの人数が
 // 変わるたびに自動ずらし量そのものが変わり、手動で配置した写真まで一緒に動いてしまうため)
-function combinedThumbOffset(auto, manual) {
-  if (manual) return { x: manual.x, y: manual.y };
+// manual(thumbOffset)は倍率100%相当のピクセル値として保存しているため、ピンサイズ等と
+// 同様にzoomFactorを掛けてから使う(そうしないとPDFの表示倍率を変えたときに、サムネだけ
+// ピン・引き出し線から相対的にずれて見えてしまう)。
+function combinedThumbOffset(auto, manual, zoomFactor) {
+  if (manual) {
+    const zf = zoomFactor || 1;
+    return { x: manual.x * zf, y: manual.y * zf };
+  }
   return auto || { x: 0, y: 0 };
 }
 
@@ -1751,7 +1757,7 @@ function drawPin(ctx, pin) {
   const { w: thumbW, h: thumbH } = thumbBoxSize(photo, null, zoomFactor);
   const leaderLen = effLeaderLength(photo, zoomFactor);
   // 自動ずらし(同じ地点の重なり回避)＋手動での微調整を合わせたオフセット
-  const offset = combinedThumbOffset(pin.autoThumbOffset, photo.thumbOffset);
+  const offset = combinedThumbOffset(pin.autoThumbOffset, photo.thumbOffset, zoomFactor);
   const { x: thumbCx, y: thumbCy } = thumbCenter(pos, r, thumbW, thumbH, leaderLen, offset);
 
   // 撮影方向の矢印
@@ -2089,7 +2095,7 @@ function hitTestThumbnail(pos) {
     const r = effPinSize(p, zoomFactor);
     const { w: thumbW, h: thumbH } = thumbBoxSize(p, null, zoomFactor);
     const leaderLen = effLeaderLength(p, zoomFactor);
-    const offset = combinedThumbOffset(staggerMap.get(p.id), p.thumbOffset);
+    const offset = combinedThumbOffset(staggerMap.get(p.id), p.thumbOffset, zoomFactor);
     const { x: thumbCx, y: thumbCy } = thumbCenter(sp, r, thumbW, thumbH, leaderLen, offset);
     if (pos.x >= thumbCx - thumbW / 2 && pos.x <= thumbCx + thumbW / 2
       && pos.y >= thumbCy - thumbH / 2 && pos.y <= thumbCy + thumbH / 2) {
@@ -2170,20 +2176,23 @@ function onCanvasMouseMove(e) {
     renderPins();
   } else if (state.draggingThumb) {
     const photo = state.photos.find((p) => p.id === state.draggingThumb);
-    // サムネイルは画面ピクセル単位の固定オフセットで配置しているため(ピンサイズ・
-    // サムネサイズと同様にPDFの拡大率に対して不変)、ドラッグ量もそのまま加算する。
+    // thumbOffsetは表示倍率100%相当のピクセル値として保存する(ピンサイズ等のeffXxx()と同じ
+    // 考え方)。そうしないとPDFの表示倍率を変えたときに、サムネだけピン・引き出し線から
+    // 相対的な位置がずれて見えてしまうため、ドラッグ量は現在の倍率で割ってから積み上げる。
+    const zoomFactor = (getPageView(photo.pageIndex).zoom || 100) / 100;
     let prev = photo.thumbOffset;
     if (!prev) {
       // まだ手動調整していない(自動ずらしのみの)写真をドラッグし始めたときは、その時点の
-      // 自動ずらし量を手動オフセットの初期値にする。そうしないとドラッグを始めた瞬間、
-      // 自動ずらし分が手動値に上書きされて表示位置が一瞬飛んでしまう。
-      const zoomFactor = (getPageView(photo.pageIndex).zoom || 100) / 100;
+      // 自動ずらし量(現在倍率分)を倍率100%相当に換算して手動オフセットの初期値にする。
+      // そうしないとドラッグを始めた瞬間、自動ずらし分が手動値に上書きされて表示位置が
+      // 一瞬飛んでしまう。
       const photosOnPage = getPagePhotos(photo.pageIndex);
       const staggerMap = computeAutoThumbStagger(
         photosOnPage.filter((p) => p._screenPos).map((p) => ({ id: p.id, pos: p._screenPos })), zoomFactor);
-      prev = staggerMap.get(photo.id) || { x: 0, y: 0 };
+      const autoAtCurrentZoom = staggerMap.get(photo.id) || { x: 0, y: 0 };
+      prev = { x: autoAtCurrentZoom.x / zoomFactor, y: autoAtCurrentZoom.y / zoomFactor };
     }
-    photo.thumbOffset = { x: prev.x + dx, y: prev.y + dy };
+    photo.thumbOffset = { x: prev.x + dx / zoomFactor, y: prev.y + dy / zoomFactor };
     renderPins();
   } else if (state.draggingLayer) {
     const t = getPageTransform(state.currentPage);
@@ -2975,7 +2984,7 @@ async function exportCompositePdf() {
         const screenX = pin.pos.x, screenY = pin.pos.y;
         const leaderLen = effLeaderLength(pin.photo, zf);
         const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
-        const thumbOffset = combinedThumbOffset(pdfStaggerMap.get(pin.photo.id), pin.photo.thumbOffset);
+        const thumbOffset = combinedThumbOffset(pdfStaggerMap.get(pin.photo.id), pin.photo.thumbOffset, zf);
         const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, pinSizePx, thumbW, thumbH, leaderLen, thumbOffset);
 
         const center = pdfPoint(screenX, screenY);
@@ -3278,7 +3287,7 @@ async function exportExcel() {
         const r = effPinSize(pin.photo, zf);
         const { w: thumbW, h: thumbH } = thumbBoxSize(pin.photo, null, zf);
         const leaderLen = effLeaderLength(pin.photo, zf);
-        const thumbOffset = combinedThumbOffset(xlStaggerMap.get(pin.photo.id), pin.photo.thumbOffset);
+        const thumbOffset = combinedThumbOffset(xlStaggerMap.get(pin.photo.id), pin.photo.thumbOffset, zf);
         const { x: thumbCx, y: thumbCy } = thumbCenter(pin.pos, r, thumbW, thumbH, leaderLen, thumbOffset);
 
         // 描画順(下から上): 矢印 → ピン → 引き出し線 → サムネイル。同じ地点でピンが
