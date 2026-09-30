@@ -956,7 +956,10 @@ async function addPhoto(file) {
     isOriginalFile: true, // trueならfileは劣化のない原本そのもの。プロジェクト保存時、原本ファイルへ安全に書き戻せる目印
     name: file.name,
     thumbDataUrl,
-    aspectRatio, // 元写真の横÷縦。サムネイル枠を元の縦横比のまま表示するために使う
+    aspectRatio, // 元写真の横÷縦。サムネイル枠を元の縦横比のまま表示するために使う(90度回転時は回転後の値に置き換わる)
+    photoRotation: 0, // 写真ごとの回転角(0/90/180/270)。1枚ずつ個別に設定する
+    baseThumbDataUrl: thumbDataUrl, // 回転前の元サムネイル(不変)。回転のたびにここから作り直すため劣化が蓄積しない
+    baseAspectRatio: aspectRatio,   // 回転前の元の縦横比(不変)
     lat: gps ? gps.latitude : null,
     lon: gps ? gps.longitude : null,
     hasGps: !!gps,
@@ -1212,6 +1215,36 @@ function loadImage(src) {
     img.src = src;
   });
 }
+// 画像(dataUrl)を90度単位で回転させた新しいdataUrlを作る。90/270度では幅と高さが入れ替わる。
+function rotateImageDataUrl(dataUrl, rotationDeg) {
+  return loadImage(dataUrl).then((img) => {
+    const w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+    const swapped = rotationDeg === 90 || rotationDeg === 270;
+    const c = document.createElement("canvas");
+    c.width = swapped ? h : w;
+    c.height = swapped ? w : h;
+    const ctx = c.getContext("2d");
+    ctx.translate(c.width / 2, c.height / 2);
+    ctx.rotate(rotationDeg * Math.PI / 180);
+    ctx.drawImage(img, -w / 2, -h / 2, w, h);
+    return { dataUrl: c.toDataURL("image/jpeg", 0.9), aspectRatio: c.width / c.height };
+  });
+}
+// 写真を指定の角度(0/90/180/270)へ回転させる(1枚ずつ個別に設定。他の写真には影響しない)。
+// 回転のたびに劣化が蓄積しないよう、常に回転前の元サムネイル(baseThumbDataUrl)から作り直す。
+// Undo記録・再描画は呼び出し側で行う(複数選択時に1回のUndo単位へまとめるため)。
+async function applyPhotoRotation(photo, newRotation) {
+  photo.photoRotation = newRotation;
+  if (newRotation === 0) {
+    photo.thumbDataUrl = photo.baseThumbDataUrl;
+    photo.aspectRatio = photo.baseAspectRatio;
+  } else {
+    const rotated = await rotateImageDataUrl(photo.baseThumbDataUrl, newRotation);
+    photo.thumbDataUrl = rotated.dataUrl;
+    photo.aspectRatio = rotated.aspectRatio;
+  }
+  imageCache.delete(photo.id);
+}
 // 写真を縁取り・番号バッジ・ファイル名を一切付けず、元の縦横比を保ったまま
 // 指定した幅(px)にリサイズするだけの画像にする(引き伸ばし・切り抜きはしない)。
 // Excel出力の日付比較シートで、写真をそのまま貼り付けるために使う。
@@ -1236,7 +1269,9 @@ async function addOriginalPhotoImage(wb, sheet, photo, displayWidthCm, nativeCol
   const heightPx = widthPx / ar;
 
   let imgId = null;
-  if (photo.file) {
+  // 回転を設定した写真は、原本の生バイト列には回転が反映されていないため、この高画質パスは
+  // 使わずサムネイル側(回転済み)から作り直す(resizePhotoImageへフォールバック)。
+  if (photo.file && !photo.photoRotation) {
     try {
       const mime = photo.file.type || (/\.png$/i.test(photo.name) ? "image/png" : "image/jpeg");
       const ext = /png/i.test(mime) ? "png" : "jpeg";
@@ -2405,6 +2440,18 @@ function showPageContextMenu(clientX, clientY, photos) {
     menu.appendChild(detailItem);
   }
 
+  const rotateItem = document.createElement("div");
+  rotateItem.className = "ctxItem";
+  rotateItem.textContent = multi ? "🔄 写真を90度回転（選択分それぞれ）" : "🔄 写真を90度回転";
+  rotateItem.addEventListener("click", async () => {
+    hideContextMenu();
+    pushUndoSnapshot();
+    await Promise.all(photos.map((p) => applyPhotoRotation(p, ((p.photoRotation || 0) + 90) % 360)));
+    renderPins();
+    renderPhotoList();
+  });
+  menu.appendChild(rotateItem);
+
   // 誤ってドラッグでPDFの外など見えない位置までピンを動かしてしまい、
   // キャンバス上ではつかんで戻せなくなった場合の救済策。一覧側からGPS位置に戻せる。
   if (photos.some((p) => p.hasGps && p.manualOffset)) {
@@ -2686,6 +2733,9 @@ function buildProjectManifest() {
       name: p.name,
       thumbDataUrl: p.thumbDataUrl,
       aspectRatio: p.aspectRatio,
+      photoRotation: p.photoRotation,
+      baseThumbDataUrl: p.baseThumbDataUrl,
+      baseAspectRatio: p.baseAspectRatio,
       lat: p.lat,
       lon: p.lon,
       hasGps: p.hasGps,
@@ -2911,6 +2961,11 @@ async function restoreFromManifest(manifest, projectDir) {
     name: p.name,
     thumbDataUrl: p.thumbDataUrl,
     aspectRatio: p.aspectRatio || 1, // この機能追加前に保存されたproject.jsonは無いため正方形扱いにフォールバック
+    photoRotation: p.photoRotation || 0,
+    // 回転機能追加前に保存されたproject.jsonにはbaseThumbDataUrl/baseAspectRatioが無いため、
+    // その場合は現在のthumbDataUrl/aspectRatioをそのまま元画像とみなす(回転角も0のはず)
+    baseThumbDataUrl: p.baseThumbDataUrl || p.thumbDataUrl,
+    baseAspectRatio: p.baseAspectRatio != null ? p.baseAspectRatio : (p.aspectRatio || 1),
     lat: p.lat,
     lon: p.lon,
     hasGps: p.hasGps,
