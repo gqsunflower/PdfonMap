@@ -281,6 +281,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .photoRow .trashActions { display: flex; flex-direction: column; gap: 3px; flex: none; }
 .photoRow .trashActions button { font-size: 10px; padding: 3px 6px; white-space: nowrap; }
 .photoRow .trashActions button.purge { color: #dc2626; border-color: #dc2626; }
+#trashBlock .buttonRow button.purge { color: #dc2626; border-color: #dc2626; }
 
 label input[type=range] { vertical-align: middle; }
 .settingBlock label {

@@ -70,6 +70,7 @@ const state = {
 
   selectedPhotoIds: [], // 一覧で複数選択中の写真id（一括ページ移動・一括削除用）
   lastClickedPhotoId: null, // shift+クリックの範囲選択の基点
+  selectedTrashIds: [], // ゴミ箱一覧でチェックした写真id（一括で完全削除するため）
 
   undoStack: [], // Ctrl+Zで戻すための直近の状態(最大2件、古いものから)
 
@@ -380,6 +381,14 @@ function init() {
     runDayComparison();
   });
   el("dayCompareViewBtn").addEventListener("click", toggleComparePage);
+
+  el("trashSelectAllBtn").addEventListener("click", () => {
+    const trashed = state.photos.filter((p) => p.trashed);
+    const allSelected = trashed.length > 0 && trashed.every((p) => state.selectedTrashIds.includes(p.id));
+    state.selectedTrashIds = allSelected ? [] : trashed.map((p) => p.id);
+    renderTrashList();
+  });
+  el("trashPurgeSelectedBtn").addEventListener("click", purgeSelectedTrash);
 
   el("saveOverwriteBtn").addEventListener("click", saveProjectOverwrite);
   el("saveAsBtn").addEventListener("click", saveProjectAs);
@@ -1446,12 +1455,16 @@ function renderTrashList() {
   const trashed = state.photos.filter((p) => p.trashed);
   el("trashBlock").hidden = trashed.length === 0;
   el("trashCount").textContent = trashed.length ? `(${trashed.length})` : "";
+  // ゴミ箱から抜けた(復元/完全削除された)写真のチェックは残さない
+  state.selectedTrashIds = state.selectedTrashIds.filter((id) => trashed.some((p) => p.id === id));
   const box = el("trashList");
   box.innerHTML = "";
   trashed.forEach((p) => {
     const row = document.createElement("div");
     row.className = "photoRow trashedRow";
+    const checked = state.selectedTrashIds.includes(p.id);
     row.innerHTML = `
+      <input type="checkbox" class="trashCheck" data-trash-check="${p.id}" ${checked ? "checked" : ""}>
       <img src="${p.thumbDataUrl}" alt="">
       <div class="info">
         <div class="name" title="${p.name}">${p.name}</div>
@@ -1463,6 +1476,17 @@ function renderTrashList() {
       </div>
     `;
     box.appendChild(row);
+  });
+  box.querySelectorAll("input[data-trash-check]").forEach((cb) => {
+    cb.addEventListener("change", (e) => {
+      const id = Number(e.target.getAttribute("data-trash-check"));
+      if (e.target.checked) {
+        if (!state.selectedTrashIds.includes(id)) state.selectedTrashIds.push(id);
+      } else {
+        state.selectedTrashIds = state.selectedTrashIds.filter((x) => x !== id);
+      }
+      updateTrashBulkControls();
+    });
   });
   box.querySelectorAll("button[data-restore]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
@@ -1476,6 +1500,32 @@ function renderTrashList() {
       purgePhoto(state.photos.find((p) => p.id === id));
     });
   });
+  updateTrashBulkControls();
+}
+// ゴミ箱一覧の「全て選択」ボタンの表示と「選択した写真を完全に削除」ボタンの有効/無効・件数表示を更新する
+function updateTrashBulkControls() {
+  const trashed = state.photos.filter((p) => p.trashed);
+  const n = state.selectedTrashIds.length;
+  const allSelected = trashed.length > 0 && trashed.every((p) => state.selectedTrashIds.includes(p.id));
+  const selectAllBtn = el("trashSelectAllBtn");
+  selectAllBtn.textContent = allSelected ? "選択解除" : "全て選択";
+  selectAllBtn.disabled = trashed.length === 0;
+  const purgeBtn = el("trashPurgeSelectedBtn");
+  purgeBtn.textContent = n ? `選択した${n}枚を完全に削除` : "選択した写真を完全に削除";
+  purgeBtn.disabled = n === 0;
+}
+// ゴミ箱一覧でチェックした写真をまとめて完全に削除する(元に戻せない)
+function purgeSelectedTrash() {
+  const targets = state.photos.filter((p) => state.selectedTrashIds.includes(p.id));
+  if (!targets.length) return;
+  if (!confirm(`選択した${targets.length}枚を完全に削除します。元に戻せません。よろしいですか？`)) return;
+  const idsToRemove = new Set(targets.map((p) => p.id));
+  state.photos = state.photos.filter((p) => !idsToRemove.has(p.id));
+  state.selectedTrashIds = [];
+  if (idsToRemove.has(state.selectedPhotoId)) state.selectedPhotoId = null;
+  renderPhotoList();
+  buildPageList();
+  renderPins();
 }
 
 function syncLayerControlsToCurrentPage() {
@@ -2353,6 +2403,22 @@ function showPageContextMenu(clientX, clientY, photos) {
       openPinDetailPanel(clientX, clientY, photos[0]);
     });
     menu.appendChild(detailItem);
+  }
+
+  // 誤ってドラッグでPDFの外など見えない位置までピンを動かしてしまい、
+  // キャンバス上ではつかんで戻せなくなった場合の救済策。一覧側からGPS位置に戻せる。
+  if (photos.some((p) => p.hasGps && p.manualOffset)) {
+    const resetPosItem = document.createElement("div");
+    resetPosItem.className = "ctxItem";
+    resetPosItem.textContent = multi ? "📍 ピン位置をリセット（選択分すべて）" : "📍 ピン位置をリセット";
+    resetPosItem.addEventListener("click", () => {
+      pushUndoSnapshot();
+      photos.forEach((p) => { p.manualOffset = null; });
+      hideContextMenu();
+      renderPins();
+      renderPhotoList();
+    });
+    menu.appendChild(resetPosItem);
   }
 
   const delItem = document.createElement("div");
