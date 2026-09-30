@@ -2808,6 +2808,12 @@ async function writeProjectFiles(projectDir, projectName) {
       // 原本そのものなので、取り込み時と同じファイル名でそのまま書き込む(内容は変わらない)
       const bytes = await p.file.arrayBuffer();
       await writeFile(photosDir, p.name, bytes);
+      // p.fileがプロジェクト読込み時にディスクから取得したスナップショットだった場合、
+      // 今書き込んだことでそのスナップショットへの参照が無効になり、次回の上書き保存で
+      // 読み直そうとすると NotReadableError になってしまう(=「2回目の上書き保存が失敗する」不具合)。
+      // 今読み込んだ内容そのままでメモリ上のFileに差し替えておけば、ディスク側の変化に
+      // 影響されず何度でも安全に読み直せる。
+      p.file = new File([bytes], p.name, { type: p.file.type || "image/jpeg" });
     } else {
       // 原本の実体が無く縮小サムネイルしか持っていない場合、同じ名前で保存すると
       // フォルダに残っているかもしれない原本サイズの写真を小さい版で上書きしてしまうため、
