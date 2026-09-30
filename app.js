@@ -55,6 +55,8 @@ const state = {
   thumbBorderColor: "#2563eb",
 
   layerPanMode: false,
+  thumbsHidden: false, // trueの間、プレビュー上のサムネイル(と引き出し線)を一時的に非表示にする(ピンの位置確認用。エクスポートには影響しない)
+  selectedPhotoId: null, // プレビュー上でサムネイルをクリックして選択中の写真ID。Deleteキーでゴミ箱へ移動できる
   draggingPin: null,   // photo id being dragged
   draggingArrow: null, // photo id whose direction arrow is being dragged
   draggingThumb: null, // photo id whose thumbnail(だけ)を移動中
@@ -195,11 +197,16 @@ function init() {
   // Ctrl+Z(Macはcmd+Z)で直近2件までの操作を取り消す。テキスト入力欄では
   // ブラウザ標準のテキスト編集Undoを優先し、こちらは発動させない。
   window.addEventListener("keydown", (e) => {
+    const tag = document.activeElement && document.activeElement.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
     if ((e.ctrlKey || e.metaKey) && !e.shiftKey && e.key.toLowerCase() === "z") {
-      const tag = document.activeElement && document.activeElement.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA") return;
       e.preventDefault();
       undoLastAction();
+    } else if ((e.key === "Delete" || e.key === "Backspace") && state.selectedPhotoId != null) {
+      e.preventDefault();
+      const photo = state.photos.find((p) => p.id === state.selectedPhotoId);
+      setSelectedPhoto(null);
+      if (photo) trashPhoto(photo);
     }
   });
 
@@ -330,6 +337,13 @@ function init() {
 
   initPinDetailPanel();
   initPhotoLightbox();
+
+  el("toggleThumbsBtn").addEventListener("click", () => {
+    state.thumbsHidden = !state.thumbsHidden;
+    el("toggleThumbsBtn").classList.toggle("active", state.thumbsHidden);
+    el("toggleThumbsBtn").textContent = state.thumbsHidden ? "🖼 サムネを表示" : "🖼 サムネを隠す";
+    renderPins();
+  });
 
   el("layerPanBtn").addEventListener("click", () => {
     state.layerPanMode = !state.layerPanMode;
@@ -930,6 +944,7 @@ async function addPhoto(file) {
   const photo = {
     id: state.nextPhotoId++,
     file,
+    isOriginalFile: true, // trueならfileは劣化のない原本そのもの。プロジェクト保存時、原本ファイルへ安全に書き戻せる目印
     name: file.name,
     thumbDataUrl,
     aspectRatio, // 元写真の横÷縦。サムネイル枠を元の縦横比のまま表示するために使う
@@ -1407,6 +1422,7 @@ function trashPhoto(photo) {
   if (!photo) return;
   pushUndoSnapshot();
   photo.trashed = true;
+  if (state.selectedPhotoId === photo.id) state.selectedPhotoId = null;
   renderPhotoList();
   buildPageList();
   renderPins();
@@ -1421,6 +1437,7 @@ function restorePhoto(photo) {
 function purgePhoto(photo) {
   if (!confirm(`「${photo.name}」を完全に削除します。元に戻せません。よろしいですか？`)) return;
   state.photos = state.photos.filter((p) => p.id !== photo.id);
+  if (state.selectedPhotoId === photo.id) state.selectedPhotoId = null;
   renderPhotoList();
   buildPageList();
   renderPins();
@@ -1673,11 +1690,13 @@ function computeAutoThumbStagger(items, zoomFactor) {
   }
   return result;
 }
-// 自動ずらし(auto)と手動での微調整(manual、thumbOffset)を足し合わせる
+// 自動ずらし(auto)と手動での微調整(manual、thumbOffset)を合わせる。
+// 手動で動かした後は自動ずらし分を足し込まず、手動値をそのまま使う。
+// (足し込む仕様のままだと、他の写真をゴミ箱に移動して同じ地点のクラスタの人数が
+// 変わるたびに自動ずらし量そのものが変わり、手動で配置した写真まで一緒に動いてしまうため)
 function combinedThumbOffset(auto, manual) {
-  const a = auto || { x: 0, y: 0 };
-  const m = manual || { x: 0, y: 0 };
-  return { x: a.x + m.x, y: a.y + m.y };
+  if (manual) return { x: manual.x, y: manual.y };
+  return auto || { x: 0, y: 0 };
 }
 
 // 写真レイヤーの範囲を示すガイド枠。四辺すべて赤い実線で表示する。
@@ -1774,6 +1793,8 @@ function drawPin(ctx, pin) {
   ctx.fillText(label, pos.x, pos.y + 0.5);
   ctx.restore();
 
+  if (state.thumbsHidden) return;
+
   // 引き出し線
   ctx.save();
   ctx.strokeStyle = effLeaderColor(photo);
@@ -1798,6 +1819,41 @@ function drawPin(ctx, pin) {
   }
   ctx.strokeRect(thumbCx - thumbW / 2, thumbCy - thumbH / 2, thumbW, thumbH);
   ctx.restore();
+
+  // 撮影時刻(表示のみ。PDF/Excel出力には含めない)。GPSが少しずれていても、
+  // 同じ場所で撮った写真かどうかを時刻で見分ける参考にする。
+  if (photo.capturedAt) {
+    const timeText = formatCaptureTimeShort(photo.capturedAt);
+    const fontSize = Math.max(9, 10 * zoomFactor);
+    ctx.save();
+    ctx.font = `${fontSize}px sans-serif`;
+    ctx.textAlign = "center";
+    ctx.textBaseline = "top";
+    const textY = thumbCy + thumbH / 2 + inset + 2;
+    const textW = ctx.measureText(timeText).width;
+    ctx.fillStyle = "rgba(255,255,255,0.85)";
+    ctx.fillRect(thumbCx - textW / 2 - 3, textY - 1, textW + 6, fontSize + 3);
+    ctx.fillStyle = "#111";
+    ctx.fillText(timeText, thumbCx, textY);
+    ctx.restore();
+  }
+
+  // 選択中の写真を示す枠(クリックで選択→Deleteキーでゴミ箱へ移動できる)
+  if (photo.id === state.selectedPhotoId) {
+    ctx.save();
+    ctx.strokeStyle = "#f59e0b";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.strokeRect(thumbCx - thumbW / 2 - 3, thumbCy - thumbH / 2 - 3, thumbW + 6, thumbH + 6);
+    ctx.restore();
+  }
+}
+
+function formatCaptureTimeShort(date) {
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  const ss = String(date.getSeconds()).padStart(2, "0");
+  return `${hh}:${mm}:${ss}`;
 }
 
 const imageCache = new Map();
@@ -1863,6 +1919,12 @@ function onCanvasClick(e) {
   tryRunCalibration();
 }
 
+// プレビュー上でサムネイルをクリックして選択状態にする(Deleteキーでのゴミ箱移動に使う)
+function setSelectedPhoto(id) {
+  if (state.selectedPhotoId === id) return;
+  state.selectedPhotoId = id;
+  renderPins();
+}
 function onCanvasMouseDown(e) {
   if (state.calibrating) return;
   const pos = canvasPosFromEvent(e);
@@ -1870,6 +1932,7 @@ function onCanvasMouseDown(e) {
   if (arrowHit) {
     pushUndoSnapshot();
     state.draggingArrow = arrowHit.id;
+    setSelectedPhoto(null);
     return;
   }
   const hit = hitTestPin(pos);
@@ -1877,6 +1940,7 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingPin = hit.id;
     state.dragLast = pos;
+    setSelectedPhoto(null);
     return;
   }
   // 同じ地点で撮った写真同士でサムネイルが重なる場合に、ピンとは別に
@@ -1886,6 +1950,7 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingThumb = thumbHit.id;
     state.dragLast = pos;
+    setSelectedPhoto(thumbHit.id);
     return;
   }
   // 写真レイヤーの枠(赤い四角)の辺・角をつかんで拡縮できるようにする。
@@ -1894,6 +1959,7 @@ function onCanvasMouseDown(e) {
   if (handle) {
     pushUndoSnapshot();
     state.draggingResize = handle;
+    setSelectedPhoto(null);
     return;
   }
   // 「✋ レイヤー移動」モード中はキャンバスのどこでもドラッグでレイヤー移動できるが、
@@ -1902,6 +1968,9 @@ function onCanvasMouseDown(e) {
     pushUndoSnapshot();
     state.draggingLayer = true;
     state.dragLast = pos;
+    setSelectedPhoto(null);
+  } else {
+    setSelectedPhoto(null);
   }
 }
 // 2点p1-p2を結ぶ線分と点posとの最短距離、および線分上での位置(0=p1側の端,1=p2側の端)を返す
@@ -2007,6 +2076,7 @@ function hitTestPin(pos) {
 // サムネイル画像の四角部分内をクリックしたか判定(右クリックメニューをピン本体だけでなく
 // サムネイル画像からも開けるようにするため)
 function hitTestThumbnail(pos) {
+  if (state.thumbsHidden) return null;
   const photosOnPage = getPagePhotos(state.currentPage);
   const zoomFactor = (getPageView(state.currentPage).zoom || 100) / 100;
   // 描画時(drawPin)と同じ自動ずらしを再現しないと、見た目の位置とクリック判定がズレるため
@@ -2102,7 +2172,17 @@ function onCanvasMouseMove(e) {
     const photo = state.photos.find((p) => p.id === state.draggingThumb);
     // サムネイルは画面ピクセル単位の固定オフセットで配置しているため(ピンサイズ・
     // サムネサイズと同様にPDFの拡大率に対して不変)、ドラッグ量もそのまま加算する。
-    const prev = photo.thumbOffset || { x: 0, y: 0 };
+    let prev = photo.thumbOffset;
+    if (!prev) {
+      // まだ手動調整していない(自動ずらしのみの)写真をドラッグし始めたときは、その時点の
+      // 自動ずらし量を手動オフセットの初期値にする。そうしないとドラッグを始めた瞬間、
+      // 自動ずらし分が手動値に上書きされて表示位置が一瞬飛んでしまう。
+      const zoomFactor = (getPageView(photo.pageIndex).zoom || 100) / 100;
+      const photosOnPage = getPagePhotos(photo.pageIndex);
+      const staggerMap = computeAutoThumbStagger(
+        photosOnPage.filter((p) => p._screenPos).map((p) => ({ id: p.id, pos: p._screenPos })), zoomFactor);
+      prev = staggerMap.get(photo.id) || { x: 0, y: 0 };
+    }
     photo.thumbOffset = { x: prev.x + dx, y: prev.y + dy };
     renderPins();
   } else if (state.draggingLayer) {
@@ -2564,6 +2644,13 @@ async function writeFile(dirHandle, name, contents) {
   await w.close();
 }
 
+// 拡張子の手前にsuffixを挿入したファイル名を作る(例: "photo.jpg","_縮小版" → "photo_縮小版.jpg")
+function suffixedFileName(name, suffix) {
+  const extMatch = name.match(/\.[^.]+$/);
+  const ext = extMatch ? extMatch[0] : "";
+  return baseNameNoExt(name) + suffix + ext;
+}
+
 // プロジェクトフォルダ(drawing.pdf・photos/・project.json)へ書き込む共通処理。
 // 「保存(名前を付けて)」「保存(上書)」の両方から呼ばれる。
 async function writeProjectFiles(projectDir, projectName) {
@@ -2571,9 +2658,21 @@ async function writeProjectFiles(projectDir, projectName) {
   await writeFile(projectDir, "drawing.pdf", state.pdfBytesForExport);
 
   const photosDir = await projectDir.getDirectoryHandle("photos", { create: true });
+  const reducedNames = [];
   for (const p of state.photos) {
-    const bytes = p.file ? await p.file.arrayBuffer() : dataUrlToUint8Array(p.thumbDataUrl);
-    await writeFile(photosDir, p.name, bytes);
+    if (p.isOriginalFile && p.file) {
+      // 原本そのものなので、取り込み時と同じファイル名でそのまま書き込む(内容は変わらない)
+      const bytes = await p.file.arrayBuffer();
+      await writeFile(photosDir, p.name, bytes);
+    } else {
+      // 原本の実体が無く縮小サムネイルしか持っていない場合、同じ名前で保存すると
+      // フォルダに残っているかもしれない原本サイズの写真を小さい版で上書きしてしまうため、
+      // 別名(「_縮小版」を付けた名前)で保存し、原本の場所には触れないようにする。
+      const bytes = p.file ? await p.file.arrayBuffer() : dataUrlToUint8Array(p.thumbDataUrl);
+      const reducedName = suffixedFileName(p.name, "_縮小版");
+      await writeFile(photosDir, reducedName, bytes);
+      reducedNames.push(reducedName);
+    }
   }
 
   const manifest = buildProjectManifest();
@@ -2581,7 +2680,9 @@ async function writeProjectFiles(projectDir, projectName) {
 
   state.currentProjectDirHandle = projectDir;
   state.currentProjectName = projectName;
-  el("projectStatus").textContent = `プロジェクト「${projectName}」を保存しました（PDF・写真・project.json）。`;
+  el("projectStatus").textContent = reducedNames.length
+    ? `プロジェクト「${projectName}」を保存しました（PDF・写真・project.json）。\n注意: 原本の実体が無い${reducedNames.length}枚は縮小版のみのため、別名(${reducedNames.join("、")})で保存しました。原本を残したい場合はその写真を読み込み直してください。`
+    : `プロジェクト「${projectName}」を保存しました（PDF・写真・project.json）。`;
 }
 
 // 名前を付けて保存：常に保存先フォルダとプロジェクト名を新しく尋ねる
@@ -2650,7 +2751,7 @@ async function saveProjectOverwrite() {
   }
 }
 
-async function restoreFromManifest(manifest) {
+async function restoreFromManifest(manifest, projectDir) {
   const pdfBytes = base64ToArrayBuffer(manifest.pdfBase64);
   state.pdfBytesForExport = pdfBytes.slice(0);
   state.pdfName = manifest.pdfName || "drawing.pdf";
@@ -2708,9 +2809,30 @@ async function restoreFromManifest(manifest) {
   el("arrowLengthVal").value = state.arrowLength;
   el("arrowColor").value = state.arrowColor;
 
-  state.photos = (manifest.photos || []).map((p) => ({
+  // 保存フォルダのphotos/には取り込み時の原本がそのまま入っているので、読める場合はそちらを
+  // photo.fileとして使う(isOriginalFile=true)。読めない場合(フォルダ選択なしでの読込み等)は
+  // project.json内の縮小サムネイルにフォールバックする(isOriginalFile=false)。フォールバック
+  // のまま保存すると原本を上書きしてしまうため、writeProjectFilesではisOriginalFileを見て
+  // 別名で保存する。
+  let photosDirForRead = null;
+  if (projectDir) {
+    try { photosDirForRead = await projectDir.getDirectoryHandle("photos"); } catch (e) { photosDirForRead = null; }
+  }
+  state.photos = [];
+  for (const p of (manifest.photos || [])) {
+    let file = null, isOriginalFile = false;
+    if (photosDirForRead) {
+      try {
+        const fh = await photosDirForRead.getFileHandle(p.name);
+        file = await fh.getFile();
+        isOriginalFile = true;
+      } catch (e) { file = null; }
+    }
+    if (!file) { file = dataUrlToFile(p.thumbDataUrl, p.name); isOriginalFile = false; }
+    state.photos.push({
     id: p.id,
-    file: dataUrlToFile(p.thumbDataUrl, p.name),
+    file,
+    isOriginalFile,
     name: p.name,
     thumbDataUrl: p.thumbDataUrl,
     aspectRatio: p.aspectRatio || 1, // この機能追加前に保存されたproject.jsonは無いため正方形扱いにフォールバック
@@ -2736,7 +2858,8 @@ async function restoreFromManifest(manifest) {
     arrowColorOverride: p.arrowColorOverride != null ? p.arrowColorOverride : null,
     thumbBorderWidthOverride: p.thumbBorderWidthOverride != null ? p.thumbBorderWidthOverride : null,
     thumbBorderColorOverride: p.thumbBorderColorOverride != null ? p.thumbBorderColorOverride : null,
-  }));
+    });
+  }
   state.nextPhotoId = manifest.nextPhotoId || (Math.max(0, ...state.photos.map((p) => p.id)) + 1);
   imageCache.clear();
 
@@ -2791,7 +2914,7 @@ async function onProjectFileSelected(file, projectDir) {
     el("projectStatus").textContent = "プロジェクトを読み込み中...";
     const text = await file.text();
     const manifest = JSON.parse(text);
-    await restoreFromManifest(manifest);
+    await restoreFromManifest(manifest, projectDir);
     state.currentProjectDirHandle = projectDir || null;
     state.currentProjectName = projectDir ? projectDir.name : null;
     el("projectStatus").textContent = `プロジェクトを読み込みました（${state.pdfName}）。`;

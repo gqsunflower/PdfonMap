@@ -177,6 +177,8 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .toolgroup { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); margin: 8px 0; }
 .toolgroup.wrap { flex-wrap: wrap; }
 .toolgroup label { display: flex; align-items: center; gap: 5px; }
+
+#previewToolbar { margin: 0; padding: 6px 10px; background: #fff; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
 #pageIndicator { min-width: 50px; text-align: center; font-variant-numeric: tabular-nums; }
 
 .buttonRow { display: flex; gap: 8px; }
