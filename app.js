@@ -502,7 +502,7 @@ function zoomByWheel(deltaY) {
 // 図面上の位置がズレないようにする。変更があった場合のみ true を返す。
 function setPageZoom(pageIndex, newZoom) {
   const v = getPageView(pageIndex);
-  newZoom = Math.min(400, Math.max(25, Math.round(newZoom)));
+  newZoom = Math.min(800, Math.max(25, Math.round(newZoom)));
   if (newZoom === v.zoom) return false;
   const factor = newZoom / v.zoom;
   v.zoom = newZoom;
@@ -1862,27 +1862,114 @@ function findCellAtPoint(gridLines, px, py, tol) {
   return { x0: left.x, x1: right.x, y0: below.y, y1: above.y };
 }
 
-function cellKey(cell) {
-  return [cell.x0, cell.y0, cell.x1, cell.y1].map((n) => n.toFixed(2)).join(",");
+// セルの4隅(PDF座標系)を返す。新形式はcorners、旧形式(x0/y0/x1/y1の軸平行矩形のみ)は
+// 保存済みproject.jsonとの互換性のためここで4隅に変換する。
+function cellCorners(cell) {
+  if (cell.corners) return cell.corners;
+  return [
+    { x: cell.x0, y: cell.y0 }, { x: cell.x1, y: cell.y0 },
+    { x: cell.x1, y: cell.y1 }, { x: cell.x0, y: cell.y1 },
+  ];
 }
 
-// クリック位置の升目の着色をON/OFFする(数えている最中の一時的な目印)
+function cellKey(cell) {
+  return cellCorners(cell).map((p) => `${p.x.toFixed(2)},${p.y.toFixed(2)}`).join("|");
+}
+
+// PDFの格子が線・矩形の描画データではなく画像(ラスター)として埋め込まれている、あるいは
+// 歪み・回転などで軸に平行でないページ向けのフォールバック。クリック地点から塗りつぶし
+// (flood fill)を行い、背景と明暗が大きく変わる地点(線)に当たったら止めることで、実際に
+// 囲まれている範囲の形をそのまま捉える。長方形に限らず、台形や三角形のような形でも
+// 対応できる。結果は4隅の概形(対角線方向の端点)として返す。戻り値はキャンバスのピクセル座標。
+function findCellCornersByFloodFill(canvas, startX, startY, maxDist) {
+  maxDist = maxDist || 500;
+  startX = Math.round(startX); startY = Math.round(startY);
+  if (startX < 0 || startY < 0 || startX >= canvas.width || startY >= canvas.height) return null;
+  const rx0 = Math.max(0, startX - maxDist), ry0 = Math.max(0, startY - maxDist);
+  const rx1 = Math.min(canvas.width, startX + maxDist), ry1 = Math.min(canvas.height, startY + maxDist);
+  const rw = rx1 - rx0, rh = ry1 - ry0;
+  if (rw <= 2 || rh <= 2) return null;
+  const img = canvas.getContext("2d").getImageData(rx0, ry0, rw, rh);
+  const data = img.data;
+  const lumAt = (lx, ly) => {
+    const idx = (ly * rw + lx) * 4;
+    return 0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+  };
+  const sx = startX - rx0, sy = startY - ry0;
+  const bgLum = lumAt(sx, sy);
+  const THRESH = 40; // クリック地点の明るさからこれだけ変わったら線(境界)とみなす
+  const visited = new Uint8Array(rw * rh);
+  const maxPixels = Math.floor(rw * rh * 0.6); // これを超えて広がったら「囲まれていない」とみなして諦める
+  const qx = new Int32Array(maxPixels + 8);
+  const qy = new Int32Array(maxPixels + 8);
+  let qHead = 0, qTail = 0;
+  qx[qTail] = sx; qy[qTail] = sy; qTail++;
+  visited[sy * rw + sx] = 1;
+  // 対角線方向(x+y, x-y)それぞれの最小・最大点を凸四角形の4隅の近似として使う
+  // (長方形はもちろん、回転・台形状に歪んだ四角形、三角形などでも概形を捉えられる)
+  let minSum = Infinity, maxSum = -Infinity, minDiff = Infinity, maxDiff = -Infinity;
+  let cTopLeft = null, cTopRight = null, cBottomRight = null, cBottomLeft = null;
+  let count = 0, hitEdge = false, overflowed = false;
+  while (qHead < qTail) {
+    const x = qx[qHead], y = qy[qHead]; qHead++;
+    count++;
+    if (count > maxPixels) { overflowed = true; break; }
+    if (x === 0 || x === rw - 1 || y === 0 || y === rh - 1) hitEdge = true;
+    const gx = x + rx0, gy = y + ry0;
+    const sum = gx + gy, diff = gx - gy;
+    if (sum < minSum) { minSum = sum; cTopLeft = { x: gx, y: gy }; }
+    if (sum > maxSum) { maxSum = sum; cBottomRight = { x: gx, y: gy }; }
+    if (diff < minDiff) { minDiff = diff; cBottomLeft = { x: gx, y: gy }; }
+    if (diff > maxDiff) { maxDiff = diff; cTopRight = { x: gx, y: gy }; }
+    const neighbors = [[x - 1, y], [x + 1, y], [x, y - 1], [x, y + 1]];
+    for (const [nx, ny] of neighbors) {
+      if (nx < 0 || nx >= rw || ny < 0 || ny >= rh) continue;
+      const vi = ny * rw + nx;
+      if (visited[vi]) continue;
+      if (Math.abs(lumAt(nx, ny) - bgLum) > THRESH) continue;
+      if (qTail >= qx.length) { overflowed = true; break; }
+      visited[vi] = 1;
+      qx[qTail] = nx; qy[qTail] = ny; qTail++;
+    }
+    if (overflowed) break;
+  }
+  if (overflowed || hitEdge) return null; // 囲まれた範囲が見つからなかった(境界がウィンドウ外、または無制限に広がる)
+  if (!cTopLeft || !cTopRight || !cBottomRight || !cBottomLeft) return null;
+  return [cTopLeft, cTopRight, cBottomRight, cBottomLeft];
+}
+
 async function toggleCellAtEvent(e) {
   if (!state.pdfDoc || !state.pageViewport || state.currentPage === "compare" || state.currentPage < 0) return;
   const pos = canvasPosFromEvent(e);
   const [pdfX, pdfY] = state.pageViewport.convertToPdfPoint(pos.x, pos.y);
   const gridLines = await getGridLinesForPage(state.currentPage);
-  if (!gridLines) return;
-  const cell = findCellAtPoint(gridLines, pdfX, pdfY);
-  if (!cell) return;
+  const rectCell = gridLines ? findCellAtPoint(gridLines, pdfX, pdfY) : null;
+  let corners = null;
+  if (rectCell) {
+    corners = [
+      { x: rectCell.x0, y: rectCell.y0 }, { x: rectCell.x1, y: rectCell.y0 },
+      { x: rectCell.x1, y: rectCell.y1 }, { x: rectCell.x0, y: rectCell.y1 },
+    ];
+  } else {
+    // 線・矩形の描画データから見つからない場合(格子が画像として埋め込まれている、
+    // 歪んでいる、長方形でない等)は、実際に描画されたピクセルから塗りつぶして概形を推定する。
+    const pixelCorners = findCellCornersByFloodFill(el("pdfCanvas"), pos.x, pos.y);
+    if (pixelCorners) {
+      corners = pixelCorners.map((p) => {
+        const [px, py] = state.pageViewport.convertToPdfPoint(p.x, p.y);
+        return { x: px, y: py };
+      });
+    }
+  }
+  if (!corners) return;
   pushUndoSnapshot();
   let pageMap = state.cellHighlights.get(state.currentPage);
   if (!pageMap) { pageMap = new Map(); state.cellHighlights.set(state.currentPage, pageMap); }
-  const key = cellKey(cell);
+  const key = cellKey({ corners });
   // 色・不透明度はセルごとに、着色した時点で選んでいた値を固定で持たせる。あとで設定を
   // 変えても、既に着色済みのセルまでさかのぼって変わってしまわないようにするため。
   if (pageMap.has(key)) pageMap.delete(key);
-  else pageMap.set(key, { ...cell, color: state.cellHighlightColor, opacity: state.cellHighlightOpacity });
+  else pageMap.set(key, { corners, color: state.cellHighlightColor, opacity: state.cellHighlightOpacity });
   renderPins();
 }
 
@@ -1896,9 +1983,7 @@ function drawCellHighlights(ctx, canvas) {
     const [cr, cg, cb] = hexToRgbTriple(cell.color || state.cellHighlightColor);
     const cellOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
     ctx.fillStyle = `rgba(${Math.round(cr * 255)}, ${Math.round(cg * 255)}, ${Math.round(cb * 255)}, ${cellOpacity})`;
-    const corners = [
-      [cell.x0, cell.y0], [cell.x1, cell.y0], [cell.x1, cell.y1], [cell.x0, cell.y1],
-    ].map(([px, py]) => {
+    const corners = cellCorners(cell).map(({ x: px, y: py }) => {
       const [vx, vy] = state.pageViewport.convertToViewportPoint(px, py);
       return rotateForView({ x: vx, y: vy }, canvas, v.rotation || 0);
     });
@@ -1979,8 +2064,14 @@ function computeAutoThumbStagger(items, zoomFactor) {
         used.add(other.id);
       }
     }
+    // 同じ地点に写真が多いと一直線の斜めずらしでは図面の遠くまで伸びてしまうため、
+    // ほぼ正方形になるように折り返しながら格子状に並べる(行・列ともstep間隔)。
     const step = AUTO_THUMB_STAGGER_STEP * zf;
-    cluster.forEach((p, i) => result.set(p.id, { x: i * step, y: i * step }));
+    const cols = Math.max(1, Math.ceil(Math.sqrt(cluster.length)));
+    cluster.forEach((p, i) => {
+      const row = Math.floor(i / cols), col = i % cols;
+      result.set(p.id, { x: col * step, y: row * step });
+    });
   }
   return result;
 }
@@ -3330,11 +3421,12 @@ async function exportCompositePdf() {
       for (const cell of pageMap.values()) {
         const [chR, chG, chB] = hexToRgbTriple(cell.color || state.cellHighlightColor);
         const chOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
-        page.drawRectangle({
-          x: cell.x0, y: cell.y0,
-          width: cell.x1 - cell.x0, height: cell.y1 - cell.y0,
-          color: rgb(chR, chG, chB), opacity: chOpacity,
-        });
+        // drawSvgPathはSVGと同じ「Yが下向き」のローカル座標系で解釈されるため、
+        // 絶対座標(PDF空間、Y上向き)の頂点をそのまま使うにはYの符号を反転させ、
+        // 基点(x,y)は(0,0)のまま渡す。
+        const corners = cellCorners(cell);
+        const d = "M " + corners.map((p) => `${p.x} ${-p.y}`).join(" L ") + " Z";
+        page.drawSvgPath(d, { x: 0, y: 0, color: rgb(chR, chG, chB), opacity: chOpacity });
       }
     }
 
@@ -3673,11 +3765,12 @@ async function exportExcel() {
           const [cR, cG, cB] = hexToRgbTriple(cell.color || state.cellHighlightColor);
           const cellOpacity = (cell.opacity != null ? cell.opacity : state.cellHighlightOpacity) / 100;
           bgCtx.fillStyle = `rgba(${Math.round(cR * 255)}, ${Math.round(cG * 255)}, ${Math.round(cB * 255)}, ${cellOpacity})`;
-          const p0 = viewport.convertToViewportPoint(cell.x0, cell.y0);
-          const p1 = viewport.convertToViewportPoint(cell.x1, cell.y1);
-          const x0 = Math.min(p0[0], p1[0]), x1 = Math.max(p0[0], p1[0]);
-          const y0 = Math.min(p0[1], p1[1]), y1 = Math.max(p0[1], p1[1]);
-          bgCtx.fillRect(x0, y0, x1 - x0, y1 - y0);
+          const corners = cellCorners(cell).map((p) => viewport.convertToViewportPoint(p.x, p.y));
+          bgCtx.beginPath();
+          bgCtx.moveTo(corners[0][0], corners[0][1]);
+          for (let i = 1; i < corners.length; i++) bgCtx.lineTo(corners[i][0], corners[i][1]);
+          bgCtx.closePath();
+          bgCtx.fill();
         }
         bgCtx.restore();
       }
